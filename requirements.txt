@@ -1,0 +1,13 @@
+pandas>=2.2
+numpy>=1.26
+PyYAML>=6.0
+rich>=13.7
+pytest>=8.0
+ruff>=0.5
+mypy>=1.10
+scikit-learn>=1.5
+joblib>=1.4
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.8
+torch

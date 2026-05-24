@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+outputs/backtests/*
+!outputs/backtests/.gitkeep
+
+.env
+.idea/
+.vscode/
+
+outputs/models/*
+!outputs/models/.gitkeep
