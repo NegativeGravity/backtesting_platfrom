@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from trading_system.ml.splits import time_based_train_validation_test_split
+from backend.ml.splits import time_based_train_validation_test_split
 
 
 def test_time_based_split_preserves_order() -> None:

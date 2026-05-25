@@ -1,8 +1,8 @@
 import pandas as pd
 import pytest
 
-from trading_system.core.exceptions import DataValidationError
-from trading_system.data.validator import validate_ohlcv
+from backend.core.exceptions import DataValidationError
+from backend.data.validator import validate_ohlcv
 
 
 def test_validator_rejects_duplicate_timestamps() -> None:

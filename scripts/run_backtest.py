@@ -6,14 +6,14 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from trading_system.backtest.engine import BacktestEngine
-from trading_system.core.config import load_config
-from trading_system.core.logging import setup_logging
-from trading_system.core.paths import resolve_project_path
-from trading_system.data.csv_loader import load_ohlcv_csv
-from trading_system.data.market_data import filter_date_range
-from trading_system.data.validator import validate_ohlcv
-from trading_system.strategy.factory import create_strategy
+from backend.backtest.engine import BacktestEngine
+from backend.core.config import load_config
+from backend.core.logging import setup_logging
+from backend.core.paths import resolve_project_path
+from backend.data.csv_loader import load_ohlcv_csv
+from backend.data.market_data import filter_date_range
+from backend.data.validator import validate_ohlcv
+from backend.strategy.factory import create_strategy
 
 logger = logging.getLogger(__name__)
 console = Console()

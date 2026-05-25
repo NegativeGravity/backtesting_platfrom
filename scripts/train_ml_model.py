@@ -3,12 +3,12 @@ import logging
 from rich.console import Console
 from rich.table import Table
 
-from trading_system.core.config import load_config
-from trading_system.core.logging import setup_logging
-from trading_system.data.csv_loader import load_ohlcv_csv
-from trading_system.data.market_data import filter_date_range
-from trading_system.data.validator import validate_ohlcv
-from trading_system.ml.trainer import train_ml_momentum_model
+from backend.core.config import load_config
+from backend.core.logging import setup_logging
+from backend.data.csv_loader import load_ohlcv_csv
+from backend.data.market_data import filter_date_range
+from backend.data.validator import validate_ohlcv
+from backend.ml.trainer import train_ml_momentum_model
 
 logger = logging.getLogger(__name__)
 console = Console()

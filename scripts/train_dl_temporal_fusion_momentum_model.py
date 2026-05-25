@@ -2,35 +2,50 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score
+import torch
+from sklearn.metrics import accuracy_score, f1_score
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
 
-from trading_system.core.config import load_config
-from trading_system.core.time import timestamp_for_run_id
-from trading_system.data.csv_loader import load_ohlcv_csv
-from trading_system.data.market_data import filter_date_range
-from trading_system.data.validator import validate_ohlcv
+from backend.data.market_store import MarketDataStore
+
 
 FEATURE_COLUMNS = [
-    "log_return_1", "log_return_3", "log_return_12", "body_atr", "range_atr",
-    "upper_wick_atr", "lower_wick_atr", "ema_16_distance", "ema_64_distance",
-    "ema_spread", "realized_vol_24", "realized_vol_64", "volume_z",
-    "channel_position", "breakout_distance_atr", "breakdown_distance_atr",
+    "log_return_1",
+    "log_return_3",
+    "log_return_12",
+    "body_atr",
+    "range_atr",
+    "upper_wick_atr",
+    "lower_wick_atr",
+    "ema_16_distance",
+    "ema_64_distance",
+    "ema_spread",
+    "realized_vol_24",
+    "realized_vol_64",
+    "volume_z",
+    "channel_position",
+    "breakout_distance_atr",
+    "breakdown_distance_atr",
 ]
 
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
     previous_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1.0 / window, adjust=False).mean()
+    true_range = pd.concat(
+        [(high - low), (high - previous_close).abs(), (low - previous_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return true_range.ewm(alpha=1.0 / window, adjust=False).mean()
 
 
-def build_features(data: pd.DataFrame) -> pd.DataFrame:
-    df = data.copy().reset_index(drop=True)
+def build_features(frame: pd.DataFrame) -> pd.DataFrame:
+    df = frame.copy()
     close = df["close"].astype(float)
     high = df["high"].astype(float)
     low = df["low"].astype(float)
@@ -39,6 +54,7 @@ def build_features(data: pd.DataFrame) -> pd.DataFrame:
     log_close = np.log(close)
     log_return = log_close.diff()
     range_atr = atr(high, low, close, 14)
+
     ema_16 = close.ewm(span=16, adjust=False).mean()
     ema_64 = close.ewm(span=64, adjust=False).mean()
     volume_mean = volume.rolling(48).mean()
@@ -48,8 +64,7 @@ def build_features(data: pd.DataFrame) -> pd.DataFrame:
     channel_width = (channel_high - channel_low).replace(0.0, np.nan)
 
     features = pd.DataFrame(index=df.index)
-    features["timestamp"] = df["timestamp"]
-    features["close"] = close
+    features["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     features["log_return_1"] = log_return
     features["log_return_3"] = log_close.diff(3)
     features["log_return_12"] = log_close.diff(12)
@@ -66,221 +81,187 @@ def build_features(data: pd.DataFrame) -> pd.DataFrame:
     features["channel_position"] = (close - channel_low) / channel_width
     features["breakout_distance_atr"] = (close - channel_high) / range_atr.replace(0.0, np.nan)
     features["breakdown_distance_atr"] = (channel_low - close) / range_atr.replace(0.0, np.nan)
-    return features.replace([np.inf, -np.inf], np.nan)
+    return features
 
 
-def add_targets(frame: pd.DataFrame, horizon_bars: int, min_return_threshold: float, fee_rate: float, slippage_bps: float) -> pd.DataFrame:
-    future_return = frame["close"].shift(-horizon_bars) / frame["close"] - 1.0
-    round_trip_cost = 2.0 * (fee_rate + slippage_bps / 10_000.0)
-    long_edge = future_return - round_trip_cost
-    short_edge = -future_return - round_trip_cost
-    # map to classes: 0=down/short, 1=flat, 2=up/long for CrossEntropyLoss
-    y = np.where(long_edge > min_return_threshold, 2, np.where(short_edge > min_return_threshold, 0, 1))
-    out = frame.copy()
-    out["target"] = y.astype(int)
-    out["future_return"] = future_return
-    return out.dropna(subset=FEATURE_COLUMNS + ["target"]).reset_index(drop=True)
+def build_xy(frame: pd.DataFrame, horizon: int, min_return: float, fee_rate: float, slippage_bps: float) -> tuple[pd.DataFrame, np.ndarray]:
+    features = build_features(frame)
+    close = frame["close"].astype(float)
+    future_return = close.shift(-horizon) / close - 1.0
+    round_trip_cost = (fee_rate * 2.0) + (slippage_bps / 10_000.0 * 2.0)
+    net_forward = future_return - round_trip_cost
+    target = np.where(net_forward > min_return, 2, np.where(net_forward < -min_return, 0, 1))
+    features["target"] = target
+    dataset = features.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLUMNS + ["target"]).reset_index(drop=True)
+    return dataset[FEATURE_COLUMNS].astype(np.float32), dataset["target"].astype(np.int64).to_numpy()
 
 
-def time_boundaries(n: int, train_ratio: float, validation_ratio: float) -> tuple[int, int]:
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + validation_ratio))
-    if train_end <= 0 or val_end <= train_end or val_end >= n:
-        raise ValueError("Invalid split sizes.")
-    return train_end, val_end
+class SequenceDataset(Dataset):
+    def __init__(self, x: np.ndarray, y: np.ndarray, sequence_length: int) -> None:
+        self.x = x
+        self.y = y
+        self.sequence_length = sequence_length
+
+    def __len__(self) -> int:
+        return max(0, len(self.x) - self.sequence_length + 1)
+
+    def __getitem__(self, index: int):
+        end = index + self.sequence_length
+        return torch.from_numpy(self.x[index:end]), torch.tensor(self.y[end - 1], dtype=torch.long)
 
 
-def make_sequences(frame: pd.DataFrame, sequence_length: int, train_end: int, val_end: int) -> tuple[Any, Any, Any]:
-    import torch
-    values = frame[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(np.float32)
-    y_all = frame["target"].to_numpy(np.int64)
-    train_values = values[:train_end]
-    mean = train_values.mean(axis=0).astype(np.float32)
-    std = train_values.std(axis=0).astype(np.float32)
-    std = np.where(std == 0.0, 1.0, std).astype(np.float32)
-    values = (values - mean) / std
+class TemporalFusionLite(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float) -> None:
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            batch_first=True,
+        )
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 3),
+        )
 
-    xs, ys, indices = [], [], []
-    for end_idx in range(sequence_length - 1, len(frame)):
-        xs.append(values[end_idx - sequence_length + 1 : end_idx + 1])
-        ys.append(y_all[end_idx])
-        indices.append(end_idx)
-    x = torch.tensor(np.stack(xs), dtype=torch.float32)
-    y = torch.tensor(np.array(ys), dtype=torch.long)
-    indices_arr = np.array(indices)
-
-    train_mask = indices_arr < train_end
-    val_mask = (indices_arr >= train_end) & (indices_arr < val_end)
-    test_mask = indices_arr >= val_end
-    return (
-        (x[train_mask], y[train_mask]),
-        (x[val_mask], y[val_mask]),
-        (x[test_mask], y[test_mask]),
-        mean,
-        std,
-    )
-
-
-class SequenceClassifierModule:
-    @staticmethod
-    def build(input_size: int, hidden_size: int, dropout: float):
-        import torch
-        import torch.nn as nn
-
-        class GRUAttentionClassifier(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.norm = nn.LayerNorm(input_size)
-                self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size, num_layers=2, dropout=dropout, batch_first=True)
-                self.attn = nn.Sequential(nn.Linear(hidden_size, hidden_size // 2), nn.Tanh(), nn.Linear(hidden_size // 2, 1))
-                self.head = nn.Sequential(nn.LayerNorm(hidden_size), nn.Dropout(dropout), nn.Linear(hidden_size, 3))
-
-            def forward(self, x):
-                x = self.norm(x)
-                h, _ = self.gru(x)
-                weights = torch.softmax(self.attn(h).squeeze(-1), dim=1).unsqueeze(-1)
-                context = torch.sum(h * weights, dim=1)
-                return self.head(context)
-
-        return GRUAttentionClassifier()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        states, _ = self.gru(x)
+        weights = torch.softmax(self.attention(states), dim=1)
+        context = torch.sum(states * weights, dim=1)
+        return self.head(context)
 
 
-def batch_iter(x, y, batch_size: int, shuffle: bool = True):
-    import torch
-    indices = torch.randperm(len(x)) if shuffle else torch.arange(len(x))
-    for start in range(0, len(indices), batch_size):
-        idx = indices[start : start + batch_size]
-        yield x[idx], y[idx]
-
-
-def evaluate(model, x, y) -> dict[str, Any]:
-    import torch
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict:
     model.eval()
+    all_pred: list[int] = []
+    all_y: list[int] = []
     with torch.no_grad():
-        logits = model(x)
-        proba = torch.softmax(logits, dim=1).cpu().numpy()
-        pred = proba.argmax(axis=1)
-        true = y.cpu().numpy()
+        for x, y in loader:
+            logits = model(x.to(device))
+            pred = torch.argmax(logits, dim=1).cpu().numpy().tolist()
+            all_pred.extend(pred)
+            all_y.extend(y.numpy().tolist())
+
     return {
-        "accuracy": float(accuracy_score(true, pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(true, pred)),
-        "macro_f1": float(f1_score(true, pred, average="macro", zero_division=0)),
-        "class_distribution_true": {str(k): int(v) for k, v in zip(*np.unique(true, return_counts=True))},
-        "class_distribution_pred": {str(k): int(v) for k, v in zip(*np.unique(pred, return_counts=True))},
-        "confusion_matrix_labels_0_1_2": confusion_matrix(true, pred, labels=[0, 1, 2]).tolist(),
-        "classification_report": classification_report(true, pred, labels=[0, 1, 2], zero_division=0, output_dict=True),
+        "rows": len(all_y),
+        "accuracy": float(accuracy_score(all_y, all_pred)) if all_y else 0.0,
+        "macro_f1": float(f1_score(all_y, all_pred, average="macro", zero_division=0)) if all_y else 0.0,
     }
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(payload, file, indent=2, ensure_ascii=False, default=str)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train dl_temporal_fusion_momentum TorchScript artifact.")
-    parser.add_argument("--config", default="configs/backtest.yaml")
-    parser.add_argument("--output-dir", default=None)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--market-config", default="configs/market_data.yaml")
+    parser.add_argument("--split-policy", default="recommended")
     parser.add_argument("--sequence-length", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=35)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--horizon", type=int, default=12)
+    parser.add_argument("--min-return", type=float, default=0.0012)
+    parser.add_argument("--fee-rate", type=float, default=0.001)
+    parser.add_argument("--slippage-bps", type=float, default=2.0)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--hidden-size", type=int, default=96)
+    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.15)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--output-dir", default="outputs/models")
     args = parser.parse_args()
 
-    import torch
-    import torch.nn as nn
+    store = MarketDataStore.from_yaml(args.market_config)
+    train_features, train_y = build_xy(store.load_split_from_yaml("train", args.market_config, args.split_policy), args.horizon, args.min_return, args.fee_rate, args.slippage_bps)
+    val_features, val_y = build_xy(store.load_split_from_yaml("validation", args.market_config, args.split_policy), args.horizon, args.min_return, args.fee_rate, args.slippage_bps)
+    test_features, test_y = build_xy(store.load_split_from_yaml("test", args.market_config, args.split_policy), args.horizon, args.min_return, args.fee_rate, args.slippage_bps)
 
-    config = load_config(args.config)
-    data = load_ohlcv_csv(config.data.path, config.data.timestamp_column)
-    data = filter_date_range(data, config.backtest.start_date, config.backtest.end_date)
-    validate_ohlcv(data)
+    feature_mean = train_features.mean(axis=0).to_numpy(dtype=np.float32)
+    feature_std = train_features.std(axis=0).replace(0.0, 1.0).to_numpy(dtype=np.float32)
 
-    frame = build_features(data)
-    frame = add_targets(
-        frame,
-        horizon_bars=config.ml.horizon_bars,
-        min_return_threshold=config.ml.min_return_threshold,
-        fee_rate=config.execution.fee_rate,
-        slippage_bps=config.execution.slippage_bps,
-    )
-    train_end, val_end = time_boundaries(len(frame), config.ml.train_ratio, config.ml.validation_ratio)
-    (x_train, y_train), (x_val, y_val), (x_test, y_test), mean, std = make_sequences(frame, args.sequence_length, train_end, val_end)
+    def norm(features: pd.DataFrame) -> np.ndarray:
+        return ((features.to_numpy(dtype=np.float32) - feature_mean) / feature_std).astype(np.float32)
 
-    model = SequenceClassifierModule.build(len(FEATURE_COLUMNS), args.hidden_size, args.dropout)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    counts = torch.bincount(y_train, minlength=3).float()
-    weights = counts.sum() / torch.clamp(counts, min=1.0)
-    weights = weights / weights.mean()
-    loss_fn = nn.CrossEntropyLoss(weight=weights)
+    train_ds = SequenceDataset(norm(train_features), train_y, args.sequence_length)
+    val_ds = SequenceDataset(norm(val_features), val_y, args.sequence_length)
+    test_ds = SequenceDataset(norm(test_features), test_y, args.sequence_length)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TemporalFusionLite(len(FEATURE_COLUMNS), args.hidden_size, args.num_layers, args.dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
 
     best_state = None
-    best_val = -1.0
-    patience = 7
-    stale = 0
+    best_f1 = -1.0
+
     for epoch in range(1, args.epochs + 1):
         model.train()
-        losses = []
-        for xb, yb in batch_iter(x_train, y_train, args.batch_size, shuffle=True):
+        total_loss = 0.0
+        for x, y in train_loader:
             optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(xb), yb)
+            logits = model(x.to(device))
+            loss = criterion(logits, y.to(device))
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            losses.append(float(loss.detach().cpu()))
-        val_metrics = evaluate(model, x_val, y_val)
-        score = val_metrics["macro_f1"]
-        print(f"epoch={epoch:03d} loss={np.mean(losses):.5f} val_macro_f1={score:.4f}")
-        if score > best_val:
-            best_val = score
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            stale = 0
-        else:
-            stale += 1
-            if stale >= patience:
-                break
+            total_loss += float(loss.item())
+
+        val_metrics = evaluate(model, val_loader, device)
+        if val_metrics["macro_f1"] > best_f1:
+            best_f1 = val_metrics["macro_f1"]
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+        print(f"epoch={epoch} loss={total_loss / max(1, len(train_loader)):.6f} val_macro_f1={val_metrics['macro_f1']:.4f}")
 
     if best_state is not None:
         model.load_state_dict(best_state)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    artifact_dir = Path(args.output_dir) / f"dl_temporal_fusion_momentum_1h_{timestamp}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
     model.eval()
-
-    output_dir = Path(args.output_dir) if args.output_dir else config.ml.model_artifact_dir / f"dl_temporal_fusion_momentum_{timestamp_for_run_id()}"
-    output_dir.mkdir(parents=True, exist_ok=False)
-
-    example = torch.zeros(1, args.sequence_length, len(FEATURE_COLUMNS), dtype=torch.float32)
-    traced = torch.jit.trace(model, example)
-    traced.save(str(output_dir / "model.pt"))
+    scripted = torch.jit.script(model.cpu())
+    scripted.save(str(artifact_dir / "model.pt"))
 
     metadata = {
         "strategy": "dl_temporal_fusion_momentum",
-        "symbol": config.data.symbol,
-        "timeframe": config.data.timeframe,
-        "model_type": "GRUAttentionClassifierTorchScript",
+        "symbol": store._config.symbol,
+        "interval": store._config.interval,
         "sequence_length": args.sequence_length,
         "feature_columns": FEATURE_COLUMNS,
-        "feature_mean": mean.tolist(),
-        "feature_std": std.tolist(),
+        "feature_mean": feature_mean.tolist(),
+        "feature_std": feature_std.tolist(),
         "long_threshold": 0.60,
         "short_threshold": 0.60,
         "exit_threshold": 0.48,
         "max_entropy": 0.72,
-        "class_mapping": {"0": "down/short", "1": "flat", "2": "up/long"},
-        "horizon_bars": config.ml.horizon_bars,
+        "horizon": args.horizon,
+        "min_return": args.min_return,
+        "created_at": timestamp,
     }
-    write_json(output_dir / "metadata.json", metadata)
-    write_json(output_dir / "metrics.json", {
-        "validation": evaluate(model, x_val, y_val),
-        "test": evaluate(model, x_test, y_test),
-        "split_info": {
-            "rows_total": len(frame),
-            "sequences_train": len(x_train),
-            "sequences_validation": len(x_val),
-            "sequences_test": len(x_test),
-        },
-    })
+    (artifact_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (artifact_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "validation": evaluate(model.to(device), val_loader, device),
+                "test": evaluate(model.to(device), test_loader, device),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
-    print(f"ARTIFACT_DIR={output_dir.as_posix()}")
+    print(f"ARTIFACT_DIR={artifact_dir}")
 
 
 if __name__ == "__main__":

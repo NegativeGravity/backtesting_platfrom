@@ -1,0 +1,48 @@
+symbol: BTCUSDT
+interval: 1h
+
+binance:
+  market_type: spot
+  frequency: monthly
+  base_url: https://data.binance.vision
+  start_month: "2020-01"
+  end_month: "2025-12"
+  raw_dir: data/raw/binance/spot/monthly/klines/BTCUSDT/1h
+  processed_dir: data/processed/binance
+
+questdb:
+  table: btcusdt_klines_1h
+  pg_host: 127.0.0.1
+  pg_port: 8812
+  pg_user: admin
+  pg_password: quest
+  pg_database: qdb
+  ilp_http_host: 127.0.0.1
+  ilp_http_port: 9000
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+  ttl_seconds: 604800
+  key_prefix: market:klines:v1
+
+splits_recommended:
+  train_start: "2020-01-01T00:00:00Z"
+  train_end: "2024-01-01T00:00:00Z"
+  validation_start: "2024-01-01T00:00:00Z"
+  validation_end: "2025-01-01T00:00:00Z"
+  test_start: "2025-01-01T00:00:00Z"
+  test_end: "2026-01-01T00:00:00Z"
+
+splits_user_requested_no_overlap:
+  train_start: "2020-01-01T00:00:00Z"
+  train_end: "2025-01-01T00:00:00Z"
+  test_start: "2025-01-01T00:00:00Z"
+  test_end: "2026-01-01T00:00:00Z"
+
+splits_user_requested_with_leakage_warning:
+  train_start: "2020-01-01T00:00:00Z"
+  train_end: "2025-01-01T00:00:00Z"
+  test_start: "2024-01-01T00:00:00Z"
+  test_end: "2026-01-01T00:00:00Z"

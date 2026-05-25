@@ -1,0 +1,74 @@
+name: trading-platform
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: trading-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  questdb:
+    image: questdb/questdb:${QUESTDB_VERSION:-latest}
+    container_name: trading-questdb
+    ports:
+      - "${QUESTDB_HTTP_PORT:-9000}:9000"
+      - "${QUESTDB_PG_PORT:-8812}:8812"
+      - "${QUESTDB_ILP_PORT:-9009}:9009"
+    volumes:
+      - questdb_data:/var/lib/questdb
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: src/backend/Dockerfile
+    image: trading-platform-backend
+    container_name: trading-backend
+    environment:
+      # COVER ALL BASES: Ensure Python finds the modules regardless of how Dockerfile copies them
+      PYTHONPATH: /app:/app/src:/app/src/backend
+      APP_ENV: docker
+      MARKET_DATA_CONFIG: configs/market_data.docker.yaml
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QUESTDB_HOST: questdb
+      QUESTDB_PG_PORT: 8812
+      QUESTDB_HTTP_PORT: 9000
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      # HOT-RELOAD: Mount source code so you don't need to rebuild on every code change
+      - ./src/backend:/app/src/backend
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./configs:/app/configs
+    depends_on:
+      - redis
+      - questdb
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ${FRONTEND_CONTEXT:-./src/frontend}
+      # The context is already ./src/frontend, so the Dockerfile is just 'Dockerfile' relative to it
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    image: trading-platform-frontend
+    container_name: trading-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    volumes:
+      # Optional: Mount frontend source for hot-reload if using a dev server (Vite)
+      - ./src/frontend:/app/src/frontend
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  questdb_data:

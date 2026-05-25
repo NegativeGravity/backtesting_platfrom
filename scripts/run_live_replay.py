@@ -6,8 +6,8 @@ import multiprocessing as mp
 from rich.console import Console
 from rich.table import Table
 
-from trading_system.core.logging import setup_logging
-from trading_system.engine.live_replay import LiveReplayEngine
+from backend.core.logging import setup_logging
+from backend.engine.live_replay import LiveReplayEngine
 
 console = Console()
 

@@ -1,8 +1,8 @@
 import pandas as pd
 
-from trading_system.core.config import RiskConfig
-from trading_system.risk.position_sizer import PositionSizer
-from trading_system.strategy.signals import Signal, SignalType
+from backend.core.config import RiskConfig
+from backend.risk.position_sizer import PositionSizer
+from backend.strategy.signals import Signal, SignalType
 
 
 def test_position_sizer_respects_max_notional() -> None:

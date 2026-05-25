@@ -1,8 +1,8 @@
 import pandas as pd
 
-from trading_system.core.config import ExecutionConfig
-from trading_system.execution.orders import OrderIntent, OrderSide
-from trading_system.execution.simulator import ExecutionSimulator
+from backend.core.config import ExecutionConfig
+from backend.execution.orders import OrderIntent, OrderSide
+from backend.execution.simulator import ExecutionSimulator
 
 
 def test_buy_executes_at_next_bar_open_plus_slippage() -> None:

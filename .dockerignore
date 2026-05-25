@@ -1,0 +1,34 @@
+# Keep Docker build context usable.
+# Do NOT ignore docker/, src/, trading_system/, scripts/, configs/.
+
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+node_modules/
+dist/
+src/frontend/node_modules/
+src/frontend/dist/
+frontend/node_modules/
+frontend/dist/
+
+data/raw/
+data/processed/
+outputs/
+*.parquet
+*.zip
+
+.git/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

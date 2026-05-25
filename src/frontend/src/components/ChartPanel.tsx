@@ -439,22 +439,32 @@ function sanitizeLinePoints(points: ChartDataResponse["equity_curve"] | undefine
   return [...byTime.values()].sort((left, right) => Number(left.time) - Number(right.time));
 }
 
+// ----------------------------------------------------------------------------
+// FIXED: Using reduce prevents TS2322, TS2677, and TS18047 by building a
+// perfectly typed array of SeriesMarker<Time> without nulls or map/filter chaining.
+// ----------------------------------------------------------------------------
 function sanitizeMarkers(inputMarkers: SeriesMarker<Time>[]): SeriesMarker<Time>[] {
   return inputMarkers
-    .map((marker) => {
+    .reduce<SeriesMarker<Time>[]>((validMarkers, marker) => {
       const time = toSafeUnixTime(marker.time as number);
-      if (time === null) return null;
 
-      return {
-        ...marker,
-        time: time as Time,
-        text: String(marker.text ?? ""),
-      };
-    })
-    .filter((marker): marker is SeriesMarker<Time> => marker !== null)
+      // Only push valid elements, completely avoiding 'null' in the array
+      if (time !== null) {
+        validMarkers.push({
+          ...marker,
+          time: time as Time,
+          // Properly type-cast text to 'string | undefined' to satisfy lightweight-charts
+          text: marker.text !== undefined ? String(marker.text) : undefined,
+        });
+      }
+
+      return validMarkers;
+    }, [])
     .sort((left, right) => {
       const timeDiff = Number(left.time) - Number(right.time);
       if (timeDiff !== 0) return timeDiff;
+
+      // left and right are guaranteed to be valid markers here
       return String(left.text ?? "").localeCompare(String(right.text ?? ""));
     });
 }

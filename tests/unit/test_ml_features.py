@@ -1,6 +1,6 @@
 import pandas as pd
 
-from trading_system.ml.features import FeatureConfig, build_feature_frame
+from backend.ml.features import FeatureConfig, build_feature_frame
 
 
 def test_feature_frame_contains_target_without_future_features() -> None:
