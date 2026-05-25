@@ -4,7 +4,7 @@ folder_path = Path("src")
 output_file = Path("combined_code.txt")  # Output file name
 
 # List of extensions we want to capture
-extensions = {".py", ".ts", ".tsx"}
+extensions = {".py", ".ts", ".tsx", "yml"}
 
 with output_file.open("w", encoding="utf-8") as out:
     # rglob("*") iterates through all files and directories recursively
