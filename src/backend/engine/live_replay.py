@@ -15,8 +15,6 @@ from backend.backtest.report import BacktestReportWriter
 from backend.core.config import load_config
 from backend.core.paths import resolve_project_path
 from backend.core.time import timestamp_for_run_id
-from backend.data.csv_loader import load_ohlcv_csv
-from backend.data.market_data import filter_date_range
 from backend.data.validator import validate_ohlcv
 from backend.engine.bot_worker import run_bot_worker
 from backend.engine.messages import BotCommand, BotResponse
@@ -26,6 +24,12 @@ from backend.engine.positions import (
     PositionSide,
     build_closed_position,
     position_key,
+)
+from backend.data.market_store import MarketDataStore
+from backend.ml.time_policy import (
+    BACKTEST_START_STR,
+    BACKTEST_END_STR,
+    assert_backtest_2025_only,
 )
 from backend.events.envelope import EventEnvelope, EventType
 from backend.execution.orders import LiveOrderIntent, OrderAction
@@ -241,16 +245,17 @@ class LiveReplayEngine:
             )
 
     def _load_data(self) -> pd.DataFrame:
-        data = load_ohlcv_csv(
-            path=self._config.data.path,
-            timestamp_column=self._config.data.timestamp_column,
+        data = MarketDataStore.from_yaml().load_ohlcv(
+            start=BACKTEST_START_STR,
+            end=BACKTEST_END_STR,
+            symbol=self._config.data.symbol,
+            interval=self._config.data.timeframe,
+            use_cache=True,
         )
-        data = filter_date_range(
-            data=data,
-            start_date=self._config.backtest.start_date,
-            end_date=self._config.backtest.end_date,
-        )
+
+        assert_backtest_2025_only(data)
         validate_ohlcv(data)
+
         return data
 
     def _start_strategy_workers(self) -> None:

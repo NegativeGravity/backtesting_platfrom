@@ -13,10 +13,14 @@ from backend.backtest.robot_engine import (
 )
 from backend.core.config import load_config
 from backend.core.paths import resolve_project_path
-from backend.data.csv_loader import load_ohlcv_csv
-from backend.data.market_data import filter_date_range
 from backend.data.validator import validate_ohlcv
 from backend.strategy.factory import create_strategy
+from backend.data.market_store import MarketDataStore
+from backend.ml.time_policy import (
+    BACKTEST_START_STR,
+    BACKTEST_END_STR,
+    assert_backtest_2025_only,
+)
 
 
 def run_backtest_from_request(
@@ -24,11 +28,6 @@ def run_backtest_from_request(
     strategy_name: str,
     model_artifact_path: str | None,
 ) -> tuple[Path, dict[str, Any]]:
-    """Backward-compatible API: run one strategy as a one-worker robot.
-
-    The actual engine runs in a separate process, so API latency and failures are isolated
-    from the FastAPI process. The returned report format remains the same.
-    """
     robot_payload = {
         "robot_id": f"{strategy_name}_robot",
         "display_name": f"{strategy_name} Robot",
@@ -75,16 +74,17 @@ def run_robot_backtest_from_request(
 def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_queue: mp.Queue) -> None:
     try:
         config = load_config(config_path)
-        data = load_ohlcv_csv(
-            path=config.data.path,
-            timestamp_column=config.data.timestamp_column,
+        data = MarketDataStore.from_yaml().load_ohlcv(
+            start=BACKTEST_START_STR,
+            end=BACKTEST_END_STR,
+            symbol=config.data.symbol,
+            interval=config.data.timeframe,
+            use_cache=True,
         )
-        data = filter_date_range(
-            data=data,
-            start_date=config.backtest.start_date,
-            end_date=config.backtest.end_date,
-        )
+
+        assert_backtest_2025_only(data)
         validate_ohlcv(data)
+
 
         worker_specs: list[BacktestWorkerSpec] = []
         for raw_worker in robot.get("strategy_workers", []):

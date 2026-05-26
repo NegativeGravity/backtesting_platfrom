@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,7 @@ SplitName = Literal["train", "validation", "test", "full"]
 @dataclass(frozen=True)
 class QuestDBConfig:
     table: str = "btcusdt_klines_1h"
-    pg_host: str = "127.0.0.1"
+    pg_host: str = "questdb"
     pg_port: int = 8812
     pg_user: str = "admin"
     pg_password: str = "quest"
@@ -30,7 +31,7 @@ class QuestDBConfig:
 
 @dataclass(frozen=True)
 class RedisConfig:
-    host: str = "127.0.0.1"
+    host: str = "redis"
     port: int = 6379
     db: int = 0
     ttl_seconds: int = 604800
@@ -45,8 +46,14 @@ class MarketDataConfig:
     redis: RedisConfig = RedisConfig()
 
     @staticmethod
-    def from_yaml(path: str | Path = "configs/market_data.yaml") -> "MarketDataConfig":
-        with Path(path).open("r", encoding="utf-8") as file:
+    def from_yaml(path: str | Path | None = None) -> "MarketDataConfig":
+        config_path = Path(
+            path
+            or os.getenv("MARKET_DATA_CONFIG")
+            or "configs/market_data.yaml"
+        )
+
+        with config_path.open("r", encoding="utf-8") as file:
             raw = yaml.safe_load(file)
 
         qdb = raw["questdb"]
@@ -57,15 +64,22 @@ class MarketDataConfig:
             interval=raw["interval"],
             questdb=QuestDBConfig(
                 table=qdb["table"],
-                pg_host=qdb["pg_host"],
-                pg_port=int(qdb["pg_port"]),
+                pg_host=(
+                    os.getenv("QUESTDB_PG_HOST")
+                    or os.getenv("QUESTDB_HOST")
+                    or qdb["pg_host"]
+                ),
+                pg_port=int(
+                    os.getenv("QUESTDB_PG_PORT")
+                    or qdb["pg_port"]
+                ),
                 pg_user=qdb["pg_user"],
                 pg_password=qdb["pg_password"],
                 pg_database=qdb["pg_database"],
             ),
             redis=RedisConfig(
-                host=redis_config["host"],
-                port=int(redis_config["port"]),
+                host=os.getenv("REDIS_HOST") or redis_config["host"],
+                port=int(os.getenv("REDIS_PORT") or redis_config["port"]),
                 db=int(redis_config["db"]),
                 ttl_seconds=int(redis_config["ttl_seconds"]),
                 key_prefix=redis_config["key_prefix"],
@@ -74,11 +88,6 @@ class MarketDataConfig:
 
 
 class MarketDataStore:
-    """QuestDB source-of-truth + Redis Arrow IPC hot cache.
-
-    The returned DataFrame is compatible with the existing backtest/strategy code:
-    timestamp, open, high, low, close, volume, plus optional microstructure columns.
-    """
 
     def __init__(self, config: MarketDataConfig | None = None) -> None:
         self._config = config or MarketDataConfig()
@@ -91,7 +100,7 @@ class MarketDataStore:
         )
 
     @staticmethod
-    def from_yaml(path: str | Path = "configs/market_data.yaml") -> "MarketDataStore":
+    def from_yaml(path: str | Path | None = None) -> "MarketDataStore":
         return MarketDataStore(MarketDataConfig.from_yaml(path))
 
     def load_ohlcv(

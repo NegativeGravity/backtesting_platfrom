@@ -9,6 +9,7 @@ import pandas as pd
 from pandas.errors import EmptyDataError
 
 from backend.core.paths import resolve_project_path
+from backend.data.market_store import MarketDataStore
 
 
 class ReportRepository:
@@ -137,7 +138,11 @@ class ReportRepository:
         chart_time_range = self._line_time_range(equity_curve) or self._line_time_range(
             benchmark_curve
         )
-        candles = self._read_candles(summary, time_range=chart_time_range)
+
+        candles = self._read_candles_from_questdb(
+            summary=summary,
+            time_range=chart_time_range,
+        )
 
         markers = self._read_trade_markers(run_dir / "trades.csv")
         if not markers:
@@ -151,6 +156,73 @@ class ReportRepository:
                 "markers": markers,
             }
         )
+
+    def _read_candles_from_questdb(
+            self,
+            summary: dict[str, Any],
+            time_range: tuple[int, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        query = self._resolve_market_query(summary=summary, time_range=time_range)
+
+        dataset = MarketDataStore.from_yaml().load_ohlcv(
+            start=query["start"],
+            end=query["end"],
+            symbol=query["symbol"],
+            interval=query["interval"],
+            use_cache=True,
+        )
+
+        if dataset.empty:
+            return []
+
+        required_columns = {"timestamp", "open", "high", "low", "close"}
+        if not required_columns.issubset(set(dataset.columns)):
+            return []
+
+        by_time: dict[int, dict[str, Any]] = {}
+
+        for _, row in dataset.iterrows():
+            try:
+                unix_time = self._to_unix_seconds(row["timestamp"])
+
+                open_price = float(row["open"])
+                high_price = float(row["high"])
+                low_price = float(row["low"])
+                close_price = float(row["close"])
+
+                if not all(
+                        math.isfinite(value)
+                        for value in (open_price, high_price, low_price, close_price)
+                ):
+                    continue
+
+                if high_price < low_price:
+                    continue
+
+                existing = by_time.get(unix_time)
+
+                if existing is None:
+                    by_time[unix_time] = {
+                        "time": unix_time,
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "close": close_price,
+                    }
+                    continue
+
+                by_time[unix_time] = {
+                    "time": unix_time,
+                    "open": existing["open"],
+                    "high": max(existing["high"], high_price),
+                    "low": min(existing["low"], low_price),
+                    "close": close_price,
+                }
+
+            except Exception:
+                continue
+
+        return [by_time[key] for key in sorted(by_time)]
 
     def _read_candles(
         self,
@@ -218,6 +290,73 @@ class ReportRepository:
                 continue
 
         return [by_time[key] for key in sorted(by_time)]
+
+    def _resolve_market_query(
+            self,
+            summary: dict[str, Any],
+            time_range: tuple[int, int] | None = None,
+    ) -> dict[str, str]:
+        market_data = summary.get("market_data") or {}
+
+        symbol = (
+                market_data.get("symbol")
+                or summary.get("symbol")
+                or "BTCUSDT"
+        )
+
+        interval = (
+                market_data.get("interval")
+                or summary.get("interval")
+                or summary.get("timeframe")
+                or "1h"
+        )
+
+        start = (
+                market_data.get("start")
+                or summary.get("backtest_start")
+        )
+
+        end = (
+                market_data.get("end")
+                or summary.get("backtest_end")
+        )
+
+        if start is None or end is None:
+            if time_range is None:
+                raise ValueError(
+                    "Cannot load chart candles from QuestDB: "
+                    "summary has no backtest_start/backtest_end and equity time range is empty."
+                )
+
+            start_unix, end_unix = time_range
+
+            start_ts = pd.to_datetime(start_unix, unit="s", utc=True)
+            end_ts = pd.to_datetime(end_unix, unit="s", utc=True) + self._interval_to_timedelta(interval)
+
+            start = start_ts.isoformat()
+            end = end_ts.isoformat()
+
+        return {
+            "symbol": str(symbol),
+            "interval": str(interval),
+            "start": str(start),
+            "end": str(end),
+        }
+
+    @staticmethod
+    def _interval_to_timedelta(interval: str) -> pd.Timedelta:
+        normalized = str(interval).strip().lower()
+
+        if normalized.endswith("m"):
+            return pd.Timedelta(minutes=int(normalized[:-1]))
+
+        if normalized.endswith("h"):
+            return pd.Timedelta(hours=int(normalized[:-1]))
+
+        if normalized.endswith("d"):
+            return pd.Timedelta(days=int(normalized[:-1]))
+
+        raise ValueError(f"Unsupported interval: {interval}")
 
     def _read_line_points(self, path: Path) -> list[dict[str, Any]]:
         frame = self._safe_read_csv(

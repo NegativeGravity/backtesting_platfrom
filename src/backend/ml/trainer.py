@@ -23,8 +23,11 @@ from backend.ml.artifacts import (
     save_model_artifact,
 )
 from backend.ml.features import FEATURE_COLUMNS, FeatureConfig, build_feature_frame
-from backend.ml.splits import time_based_train_validation_test_split
-
+from backend.ml.time_policy import (
+    ModelTrainingMode,
+    assert_no_2025,
+    split_raw_for_model_training,
+)
 
 def train_ml_momentum_model(
     data: pd.DataFrame,
@@ -37,27 +40,29 @@ def train_ml_momentum_model(
         slippage_bps=config.execution.slippage_bps,
     )
 
-    feature_frame = build_feature_frame(data=data, config=feature_config)
-
-    split = time_based_train_validation_test_split(
-        data=feature_frame,
-        train_ratio=config.ml.train_ratio,
-        validation_ratio=config.ml.validation_ratio,
+    raw_split = split_raw_for_model_training(
+        data=data,
+        mode=ModelTrainingMode.TUNED,
     )
 
-    x_train = split.train[FEATURE_COLUMNS]
-    y_train = split.train["target"]
+    if raw_split.validation is None:
+        raise ValueError("Tuned model requires validation data.")
 
-    x_validation = split.validation[FEATURE_COLUMNS]
-    y_validation = split.validation["target"]
+    train_features = build_feature_frame(data=raw_split.train, config=feature_config)
+    validation_features = build_feature_frame(data=raw_split.validation, config=feature_config)
 
-    x_test = split.test[FEATURE_COLUMNS]
-    y_test = split.test["target"]
+    assert_no_2025(train_features, "ml_momentum_train_features")
+    assert_no_2025(validation_features, "ml_momentum_validation_features")
+
+    x_train = train_features[FEATURE_COLUMNS]
+    y_train = train_features["target"]
+
+    x_validation = validation_features[FEATURE_COLUMNS]
+    y_validation = validation_features["target"]
 
     scaler = StandardScaler()
     x_train_scaled = scaler.fit_transform(x_train)
     x_validation_scaled = scaler.transform(x_validation)
-    x_test_scaled = scaler.transform(x_test)
 
     model = LogisticRegression(
         max_iter=1000,
@@ -72,17 +77,10 @@ def train_ml_momentum_model(
         labels=y_validation.to_numpy(),
     )
 
-    test_probabilities = model.predict_proba(x_test_scaled)[:, 1]
 
     validation_metrics = _classification_metrics(
         labels=y_validation.to_numpy(),
         probabilities=validation_probabilities,
-        threshold=selected_threshold,
-    )
-
-    test_metrics = _classification_metrics(
-        labels=y_test.to_numpy(),
-        probabilities=test_probabilities,
         threshold=selected_threshold,
     )
 
@@ -106,25 +104,26 @@ def train_ml_momentum_model(
             "time_based_split",
             "scaler_fit_on_train_only",
             "threshold_selected_on_validation_only",
-            "test_set_not_used_for_training_or_threshold_selection",
-        ],
+            "model_never_loaded_2025_data",
+            "train_2020_2023_validation_2024",
+            "2025_reserved_for_backtest_platform",        ],
     }
 
     metrics = {
         "validation": validation_metrics,
-        "test": test_metrics,
     }
 
     split_info = {
-        "train_start": split.train.iloc[0]["timestamp"],
-        "train_end": split.train.iloc[-1]["timestamp"],
-        "validation_start": split.validation.iloc[0]["timestamp"],
-        "validation_end": split.validation.iloc[-1]["timestamp"],
-        "test_start": split.test.iloc[0]["timestamp"],
-        "test_end": split.test.iloc[-1]["timestamp"],
-        "train_rows": len(split.train),
-        "validation_rows": len(split.validation),
-        "test_rows": len(split.test),
+        "policy": "calendar_no_2025_model_awareness",
+        "mode": "tuned",
+        "train_start": train_features.iloc[0]["timestamp"],
+        "train_end": train_features.iloc[-1]["timestamp"],
+        "validation_start": validation_features.iloc[0]["timestamp"],
+        "validation_end": validation_features.iloc[-1]["timestamp"],
+        "train_rows": len(train_features),
+        "validation_rows": len(validation_features),
+        "test_rows": 0,
+        "test_policy": "reserved_for_backtest_platform_2025_only",
     }
 
     return save_model_artifact(

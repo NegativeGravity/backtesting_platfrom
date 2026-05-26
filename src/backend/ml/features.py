@@ -38,11 +38,21 @@ def build_feature_frame(data: pd.DataFrame, config: FeatureConfig) -> pd.DataFra
 
     net_future_return = future_return - estimated_round_trip_cost
 
-    frame["target"] = (net_future_return > config.min_return_threshold).astype(int)
+    valid_target = net_future_return.notna()
+
+    frame["target"] = pd.NA
+    frame.loc[valid_target, "target"] = (
+            net_future_return.loc[valid_target] > config.min_return_threshold
+    ).astype("int8")
+
     frame["future_return"] = future_return
     frame["net_future_return"] = net_future_return
 
-    frame = frame.dropna(subset=FEATURE_COLUMNS + ["target"]).reset_index(drop=True)
+    frame = frame.dropna(
+        subset=FEATURE_COLUMNS + ["target", "future_return", "net_future_return"]
+    ).reset_index(drop=True)
+
+    frame["target"] = frame["target"].astype("int8")
 
     return frame
 

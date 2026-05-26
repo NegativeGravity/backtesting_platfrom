@@ -116,15 +116,6 @@ class StrategyPortfolioView:
 
 
 class RobotBacktestEngine:
-    """Single-asset, multi-strategy robot backtest engine.
-
-    Execution contract:
-    - Strategy receives bars only up to the current closed bar.
-    - Actionable signal is queued on that bar.
-    - Queued order fills on the next bar open, exactly where a real system could first act.
-    - Every strategy worker owns exactly one independent position per symbol.
-    - The robot owns shared cash/equity and can carry multiple simultaneous positions.
-    """
 
     DEFAULT_CAPITAL_PER_TRADE_FRACTION = 0.10
     DEFAULT_STOP_LOSS_PCT = 0.02
@@ -209,11 +200,29 @@ class RobotBacktestEngine:
             periods_per_year=self._config.backtest.periods_per_year,
         )
 
+        backtest_start, backtest_end = self._infer_backtest_window()
+
         summary = {
             "run_id": run_id,
-            "dataset": str(self._config.data.path),
+
+            "dataset": None,
+            "dataset_source": "questdb",
+
             "symbol": self._config.data.symbol,
             "timeframe": self._config.data.timeframe,
+            "interval": self._config.data.timeframe,
+
+            "backtest_start": backtest_start,
+            "backtest_end": backtest_end,
+
+            "market_data": {
+                "source": "questdb",
+                "symbol": self._config.data.symbol,
+                "interval": self._config.data.timeframe,
+                "start": backtest_start,
+                "end": backtest_end,
+            },
+
             "strategy": "+".join(w.strategy_name for w in self._runtime.workers.values()),
             "robot": {
                 "robot_id": self._runtime.robot_id,
@@ -279,6 +288,38 @@ class RobotBacktestEngine:
             return
 
         self._schedule_order(worker=worker, signal=signal)
+
+    def _infer_backtest_window(self) -> tuple[str, str]:
+        if self._data.empty:
+            raise ValueError("Cannot infer backtest window from empty data.")
+
+        frame = self._data.copy()
+
+        if "timestamp" not in frame.columns and "ts" in frame.columns:
+            frame = frame.rename(columns={"ts": "timestamp"})
+
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+
+        start = frame["timestamp"].min()
+        last = frame["timestamp"].max()
+        end = last + self._interval_to_timedelta(self._config.data.timeframe)
+
+        return start.isoformat(), end.isoformat()
+
+    @staticmethod
+    def _interval_to_timedelta(interval: str) -> pd.Timedelta:
+        normalized = str(interval).strip().lower()
+
+        if normalized.endswith("m"):
+            return pd.Timedelta(minutes=int(normalized[:-1]))
+
+        if normalized.endswith("h"):
+            return pd.Timedelta(hours=int(normalized[:-1]))
+
+        if normalized.endswith("d"):
+            return pd.Timedelta(days=int(normalized[:-1]))
+
+        raise ValueError(f"Unsupported interval for backtest window inference: {interval}")
 
     def _schedule_order(self, worker: BacktestWorkerSpec, signal: Signal) -> None:
         position = self._get_worker_position(worker.worker_id, signal.symbol)

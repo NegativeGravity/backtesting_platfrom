@@ -29,19 +29,22 @@ services:
     image: trading-platform-backend
     container_name: trading-backend
     environment:
-      # COVER ALL BASES: Ensure Python finds the modules regardless of how Dockerfile copies them
       PYTHONPATH: /app:/app/src:/app/src/backend
       APP_ENV: docker
-      MARKET_DATA_CONFIG: configs/market_data.docker.yaml
+
+      MARKET_DATA_CONFIG: /app/configs/market_data.docker.yaml
+
       REDIS_HOST: redis
       REDIS_PORT: 6379
+
       QUESTDB_HOST: questdb
+      QUESTDB_PG_HOST: questdb
       QUESTDB_PG_PORT: 8812
+      QUESTDB_HTTP_HOST: questdb
       QUESTDB_HTTP_PORT: 9000
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
-      # HOT-RELOAD: Mount source code so you don't need to rebuild on every code change
       - ./src/backend:/app/src/backend
       - ./data:/app/data
       - ./outputs:/app/outputs
@@ -54,7 +57,6 @@ services:
   frontend:
     build:
       context: ${FRONTEND_CONTEXT:-./src/frontend}
-      # The context is already ./src/frontend, so the Dockerfile is just 'Dockerfile' relative to it
       dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
@@ -62,9 +64,6 @@ services:
     container_name: trading-frontend
     ports:
       - "${FRONTEND_PORT:-3000}:80"
-    volumes:
-      # Optional: Mount frontend source for hot-reload if using a dev server (Vite)
-      - ./src/frontend:/app/src/frontend
     depends_on:
       - backend
     restart: unless-stopped
