@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -15,6 +16,7 @@ import pyarrow.ipc as ipc
 import redis
 import yaml
 
+from backend.core.paths import resolve_config_path, resolve_project_path
 
 SplitName = Literal["train", "validation", "test", "full"]
 
@@ -35,7 +37,7 @@ class RedisConfig:
     port: int = 6379
     db: int = 0
     ttl_seconds: int = 604800
-    key_prefix: str = "market:klines:v1"
+    key_prefix: str = "market:klines:v2"
 
 
 @dataclass(frozen=True)
@@ -47,11 +49,7 @@ class MarketDataConfig:
 
     @staticmethod
     def from_yaml(path: str | Path | None = None) -> "MarketDataConfig":
-        config_path = Path(
-            path
-            or os.getenv("MARKET_DATA_CONFIG")
-            or "configs/market_data.yaml"
-        )
+        config_path = resolve_config_path(path or os.getenv("MARKET_DATA_CONFIG") or "configs/market_data.yaml")
 
         with config_path.open("r", encoding="utf-8") as file:
             raw = yaml.safe_load(file)
@@ -135,7 +133,7 @@ class MarketDataStore:
         split_policy: str = "recommended",
         use_cache: bool = True,
     ) -> pd.DataFrame:
-        with Path(market_config_path).open("r", encoding="utf-8") as file:
+        with resolve_config_path(market_config_path).open("r", encoding="utf-8") as file:
             raw = yaml.safe_load(file)
 
         split_key = {
@@ -157,6 +155,7 @@ class MarketDataStore:
         return self.load_ohlcv(start=start, end=end, use_cache=use_cache)
 
     def _query_questdb(self, symbol: str, interval: str, start: str, end: str) -> pd.DataFrame:
+        table = self._validated_table_name(self._config.questdb.table)
         sql = f"""
         SELECT
             ts AS timestamp,
@@ -169,7 +168,7 @@ class MarketDataStore:
             trade_count,
             taker_buy_volume,
             taker_buy_quote_volume
-        FROM {self._config.questdb.table}
+        FROM {table}
         WHERE symbol = %(symbol)s
           AND interval = %(interval)s
           AND ts >= %(start)s
@@ -183,6 +182,12 @@ class MarketDataStore:
                 connection,
                 params={"symbol": symbol, "interval": interval, "start": start, "end": end},
             )
+
+    @staticmethod
+    def _validated_table_name(table: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?", table):
+            raise ValueError(f"Invalid QuestDB table identifier: {table}")
+        return table
 
     @staticmethod
     def _normalize_for_engine(frame: pd.DataFrame) -> pd.DataFrame:

@@ -1,10 +1,12 @@
+export type JsonRecord = Record<string, unknown>;
+
 export type StrategyName =
-  | "mean_reversion"
-  | "ml_momentum"
-  | "adaptive_trend_breakout"
-  | "liquidity_sweep_reversal"
-  | "ml_regime_meta_label"
-  | "dl_temporal_fusion_momentum";
+  | 'mean_reversion'
+  | 'ml_momentum'
+  | 'adaptive_trend_breakout'
+  | 'liquidity_sweep_reversal'
+  | 'ml_regime_meta_label'
+  | 'dl_temporal_fusion_momentum';
 
 export interface BacktestRunListItem {
   run_id: string;
@@ -15,6 +17,7 @@ export interface BacktestRunListItem {
   benchmark_return?: number;
   max_drawdown?: number;
   created_at?: string;
+  status?: string;
 }
 
 export interface BacktestRunRequest {
@@ -24,9 +27,12 @@ export interface BacktestRunRequest {
 }
 
 export interface BacktestRunResponse {
-  run_id: string;
-  run_dir?: string;
-  summary: Record<string, unknown>;
+  run_id?: string | null;
+  run_dir?: string | null;
+  summary?: JsonRecord;
+  job_id?: string | null;
+  status?: string | null;
+  error?: string | null;
 }
 
 export interface LiveStrategyWorkerConfig {
@@ -44,6 +50,25 @@ export interface LiveRobotConfig {
 export interface RobotBacktestRequest {
   config_path: string;
   robot: LiveRobotConfig;
+}
+
+export interface LiveReplayRequest {
+  config_path: string;
+  robots: LiveRobotConfig[];
+  replay_delay_seconds: number;
+}
+
+export interface LiveReplayResponse {
+  session_id: string;
+  websocket_url?: string;
+}
+
+export interface LiveEvent {
+  event_id?: string;
+  event_type: string;
+  timestamp?: string;
+  source: string;
+  payload: JsonRecord;
 }
 
 export interface TradeRecord {
@@ -86,7 +111,7 @@ export interface ExecutionLogRecord {
 }
 
 export interface CandlePoint {
-  time: number;
+  time: number | string;
   open: number;
   high: number;
   low: number;
@@ -94,16 +119,16 @@ export interface CandlePoint {
 }
 
 export interface LinePoint {
-  time: number;
+  time: number | string;
   value: number;
 }
 
 export interface TradeMarker {
-  time: number;
-  position: "aboveBar" | "belowBar";
-  color: string;
-  shape: "arrowUp" | "arrowDown";
-  text: string;
+  time: number | string;
+  position: 'aboveBar' | 'belowBar' | 'inBar';
+  color?: string;
+  shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square';
+  text?: string;
 }
 
 export interface ChartDataResponse {
@@ -113,16 +138,28 @@ export interface ChartDataResponse {
   markers: TradeMarker[];
 }
 
-export interface ReportResponse {
-  run_id?: string;
-  summary: Record<string, unknown>;
-  trades: TradeRecord[];
-  equity_curve?: Record<string, unknown>[];
-  benchmark_curve?: Record<string, unknown>[];
-  execution_log?: ExecutionLogRecord[];
+export interface ModelArtifactItem {
+  path: string;
+  name: string;
+  size_bytes: number;
+  modified_at: string;
 }
 
-export type PositionSide = "LONG" | "SHORT";
+export interface ReportResponse {
+  run_id?: string;
+  summary: JsonRecord;
+  trades: TradeRecord[];
+  closed_positions?: TradeRecord[];
+  equity_curve?: JsonRecord[];
+  benchmark_curve?: JsonRecord[];
+  execution_log?: ExecutionLogRecord[];
+  orders?: ExecutionLogRecord[];
+  config?: JsonRecord;
+  diagnostics?: JsonRecord;
+  model?: JsonRecord;
+}
+
+export type PositionSide = 'LONG' | 'SHORT';
 
 export interface LivePositionPayload {
   position_id: string;
@@ -131,15 +168,15 @@ export interface LivePositionPayload {
   worker_id: string;
   strategy: string;
   symbol: string;
-  side: PositionSide;
+  side: PositionSide | string;
   quantity: number;
   entry_time: string;
   exit_time?: string;
   entry_price: number;
   exit_price?: number;
   current_price?: number;
-  stop_loss: number;
-  take_profit: number;
+  stop_loss?: number;
+  take_profit?: number;
   notional?: number;
   current_notional?: number;
   gross_unrealized_pnl?: number;
@@ -150,3 +187,12 @@ export interface LivePositionPayload {
   return_pct?: number;
   exit_reason?: string;
 }
+
+export type RunDetailTab =
+  | 'overview'
+  | 'trades'
+  | 'orders'
+  | 'equity'
+  | 'diagnostics'
+  | 'config'
+  | 'model';

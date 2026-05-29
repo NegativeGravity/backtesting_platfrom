@@ -104,14 +104,14 @@ def ensure_project_root() -> Path:
 
 def ensure_env_file(root: Path) -> None:
     env_path = root / ".env"
-    env_example = root / ".env.example"
+    env_example = root / ".env"
 
     if env_path.exists():
         return
 
     if env_example.exists():
         shutil.copyfile(env_example, env_path)
-        log_ok(".env created from .env.example")
+        log_ok(".env created from .env")
         return
 
     env_path.write_text(

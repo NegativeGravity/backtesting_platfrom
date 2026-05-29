@@ -1,495 +1,418 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   createChart,
   type IChartApi,
   type ISeriesApi,
   type SeriesMarker,
   type Time,
-} from "lightweight-charts";
+} from 'lightweight-charts';
+import type { ChartDataResponse, TradeRecord } from '../types';
+import { usePreparedChartData } from '../hooks/usePreparedChartData';
+import type { PreparedCandle, PreparedLinePoint } from '../utils/chartPrep';
+import { ChartToolbar, type MarkerMode } from './ChartToolbar';
 
-import type { ChartDataResponse, TradeRecord } from "../types";
-import {
-  historicalMarkersFromTrades,
-  markersFromApiMarkers,
-} from "../utils/chartMarkers";
-import { ChartToolbar } from "./ChartToolbar";
+const FOLLOW_VISIBLE_BARS = 140;
+const FOLLOW_RIGHT_OFFSET = 10;
 
 interface ChartPanelProps {
   chartData: ChartDataResponse | null;
   trades: TradeRecord[];
+  title?: string;
 }
 
-interface SafeCandle {
-  time: Time;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-}
+const INITIAL_BARS = 180;
+const AUTO_MARKER_BUDGET = 280;
+const RESET_JUMP_THRESHOLD = 1500;
 
-interface SafeLinePoint {
-  time: Time;
-  value: number;
-}
+type LineCursorKey = 'equity' | 'benchmark' | 'drawdown';
 
-const INITIAL_REPLAY_BARS = 120;
-
-export function ChartPanel({ chartData, trades }: ChartPanelProps) {
+export function ChartPanel({ chartData, trades, title = 'Research Replay Chart' }: ChartPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const priceBoxRef = useRef<HTMLDivElement | null>(null);
+  const equityBoxRef = useRef<HTMLDivElement | null>(null);
+  const drawdownBoxRef = useRef<HTMLDivElement | null>(null);
+
   const priceChartRef = useRef<IChartApi | null>(null);
   const equityChartRef = useRef<IChartApi | null>(null);
-  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const equitySeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const benchmarkSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const drawdownChartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const equitySeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const benchmarkSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const drawdownSeriesRef = useRef<ISeriesApi<'Area'> | null>(null);
 
-  const [markersVisible, setMarkersVisible] = useState(true);
+  const prepared = usePreparedChartData(chartData, trades);
+  const [markerMode, setMarkerMode] = useState<MarkerMode>('auto');
   const [equityVisible, setEquityVisible] = useState(true);
-  const [chartError, setChartError] = useState<string | null>(null);
+  const [drawdownVisible, setDrawdownVisible] = useState(false);
   const [isReplaying, setIsReplaying] = useState(false);
-  const [replaySpeed, setReplaySpeed] = useState(6);
-  const [replayIndex, setReplayIndex] = useState(INITIAL_REPLAY_BARS);
+  const [replaySpeed, setReplaySpeed] = useState(8);
+  const [replayIndex, setReplayIndex] = useState(INITIAL_BARS);
+  const [chartError, setChartError] = useState<string | null>(null);
 
-  const safeData = useMemo(() => {
-    const candles = sanitizeCandles(chartData?.candles);
-    const equityCurve = sanitizeLinePoints(chartData?.equity_curve);
-    const benchmarkCurve = sanitizeLinePoints(chartData?.benchmark_curve);
-    const apiMarkers = markersFromApiMarkers(chartData?.markers ?? []);
-    const tradeMarkers = historicalMarkersFromTrades(trades ?? []);
-    const markers = sanitizeMarkers(tradeMarkers.length > 0 ? tradeMarkers : apiMarkers);
+  const replayRef = useRef({ index: INITIAL_BARS, lastFrame: 0, remainder: 0 });
+  const renderedIndexRef = useRef(0);
+  const lineCursorRef = useRef<Record<LineCursorKey, number>>({ equity: 0, benchmark: 0, drawdown: 0 });
 
-    return {
-      candles,
-      equityCurve,
-      benchmarkCurve,
-      markers,
-    };
-  }, [chartData, trades]);
+  const progress = prepared.candles.length > 0
+    ? (Math.min(replayIndex, prepared.candles.length) / prepared.candles.length) * 100
+    : 0;
 
-  const visibleIndex = Math.min(Math.max(replayIndex, 1), safeData.candles.length);
-  const replayProgress =
-    safeData.candles.length > 0 ? (visibleIndex / safeData.candles.length) * 100 : 0;
+  const markersUntil = useCallback((maxTime: number): SeriesMarker<Time>[] => {
+    if (markerMode === 'off' || maxTime <= 0) return [];
+    const end = upperBoundMarkers(prepared.markers, maxTime);
+    const start = markerMode === 'auto' ? Math.max(0, end - AUTO_MARKER_BUDGET) : 0;
+    return prepared.markers.slice(start, end).map((marker) => ({ ...marker, time: marker.time as Time }));
+  }, [markerMode, prepared.markers]);
 
   useEffect(() => {
-    setReplayIndex(Math.min(INITIAL_REPLAY_BARS, Math.max(1, safeData.candles.length)));
+    const start = Math.min(INITIAL_BARS, Math.max(1, prepared.candles.length));
+    setReplayIndex(start);
+    replayRef.current = { index: start, lastFrame: 0, remainder: 0 };
+    renderedIndexRef.current = 0;
+    lineCursorRef.current = { equity: 0, benchmark: 0, drawdown: 0 };
     setIsReplaying(false);
-  }, [safeData.candles.length]);
+  }, [prepared.candles.length]);
 
   useEffect(() => {
-    if (!isReplaying || safeData.candles.length === 0) return;
+    if (!containerRef.current) return;
 
-    const interval = window.setInterval(() => {
-      setReplayIndex((current) => {
-        const next = Math.min(current + replaySpeed, safeData.candles.length);
-        if (next >= safeData.candles.length) {
-          window.setTimeout(() => setIsReplaying(false), 0);
-        }
-        return next;
-      });
-    }, 120);
+    containerRef.current.innerHTML = '';
+    const priceBox = document.createElement('div');
+    const equityBox = document.createElement('div');
+    const drawdownBox = document.createElement('div');
+    priceBox.className = 'chart-box price-chart-box';
+    equityBox.className = 'chart-box sub-chart-box';
+    drawdownBox.className = 'chart-box sub-chart-box drawdown-chart-box';
+    containerRef.current.append(priceBox, equityBox, drawdownBox);
+    priceBoxRef.current = priceBox;
+    equityBoxRef.current = equityBox;
+    drawdownBoxRef.current = drawdownBox;
 
-    return () => window.clearInterval(interval);
-  }, [isReplaying, replaySpeed, safeData.candles.length]);
-
-  useEffect(() => {
-    if (!containerRef.current || !chartData) {
-      return;
-    }
-
-    if (safeData.candles.length === 0) {
-      setChartError("No valid candle data found for this report.");
-      return;
-    }
-
-    setChartError(null);
-    containerRef.current.innerHTML = "";
-
-    const priceContainer = document.createElement("div");
-    priceContainer.className = "chart-box chart-box-large";
-
-    const equityContainer = document.createElement("div");
-    equityContainer.className = "chart-box chart-equity-box";
-
-    containerRef.current.appendChild(priceContainer);
-    containerRef.current.appendChild(equityContainer);
-
-    const priceChart = createChart(priceContainer, {
-      height: 520,
+    const chartOptions = {
       autoSize: true,
-      layout: {
-        textColor: "#e6faff",
-        background: { color: "#050b16" },
-      },
+      layout: { textColor: '#b8c7dd', background: { color: '#0b1220' } },
       grid: {
-        vertLines: { color: "rgba(34, 211, 238, 0.09)" },
-        horzLines: { color: "rgba(34, 211, 238, 0.09)" },
+        vertLines: { color: 'rgba(148, 163, 184, 0.08)' },
+        horzLines: { color: 'rgba(148, 163, 184, 0.08)' },
       },
-      rightPriceScale: {
-        borderColor: "rgba(34, 211, 238, 0.26)",
-        scaleMargins: {
-          top: 0.08,
-          bottom: 0.18,
-        },
-      },
+      rightPriceScale: { borderColor: 'rgba(148, 163, 184, 0.22)' },
       timeScale: {
-        borderColor: "rgba(34, 211, 238, 0.26)",
+        borderColor: 'rgba(148, 163, 184, 0.22)',
         timeVisible: true,
         secondsVisible: false,
-        rightOffset: 14,
-        barSpacing: 8,
-        minBarSpacing: 0.5,
+        rightOffset: 12,
+        barSpacing: 7,
+        minBarSpacing: 0.35,
         lockVisibleTimeRangeOnResize: true,
       },
       crosshair: {
         mode: 1,
-        vertLine: {
-          color: "rgba(165, 243, 252, 0.70)",
-          width: 1,
-          style: 3,
-          labelBackgroundColor: "#6d28d9",
-        },
-        horzLine: {
-          color: "rgba(165, 243, 252, 0.70)",
-          width: 1,
-          style: 3,
-          labelBackgroundColor: "#6d28d9",
-        },
+        vertLine: { color: 'rgba(96, 165, 250, .75)', style: 3, labelBackgroundColor: '#2563eb' },
+        horzLine: { color: 'rgba(96, 165, 250, .75)', style: 3, labelBackgroundColor: '#2563eb' },
       },
-      handleScroll: {
-        mouseWheel: true,
-        pressedMouseMove: true,
-        horzTouchDrag: true,
-        vertTouchDrag: true,
-      },
-      handleScale: {
-        axisPressedMouseMove: true,
-        mouseWheel: true,
-        pinch: true,
-      },
-    });
+      handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+    } as const;
 
+    const priceChart = createChart(priceBox, { ...chartOptions, height: 560 });
     const candleSeries = priceChart.addCandlestickSeries({
-      upColor: "#22d3ee",
-      downColor: "#fb4567",
-      borderUpColor: "#67e8f9",
-      borderDownColor: "#ff6b87",
-      wickUpColor: "#a5f3fc",
-      wickDownColor: "#fecdd3",
-      priceFormat: {
-        type: "price",
-        precision: 2,
-        minMove: 0.01,
-      },
+      upColor: '#22ab94',
+      downColor: '#f23645',
+      borderUpColor: '#22ab94',
+      borderDownColor: '#f23645',
+      wickUpColor: '#22ab94',
+      wickDownColor: '#f23645',
+      priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
     });
 
-    const equityChart = createChart(equityContainer, {
-      height: 260,
-      autoSize: true,
-      layout: {
-        textColor: "#e6faff",
-        background: { color: "#050b16" },
-      },
-      grid: {
-        vertLines: { color: "rgba(34, 211, 238, 0.09)" },
-        horzLines: { color: "rgba(34, 211, 238, 0.09)" },
-      },
-      rightPriceScale: {
-        borderColor: "rgba(34, 211, 238, 0.26)",
-      },
-      timeScale: {
-        borderColor: "rgba(34, 211, 238, 0.26)",
-        timeVisible: true,
-        secondsVisible: false,
-        rightOffset: 14,
-        barSpacing: 8,
-        minBarSpacing: 0.5,
-        lockVisibleTimeRangeOnResize: true,
-      },
+    const equityChart = createChart(equityBox, { ...chartOptions, height: 210 });
+    const equitySeries = equityChart.addLineSeries({ title: 'Strategy Equity', color: '#60a5fa', lineWidth: 2 });
+    const benchmarkSeries = equityChart.addLineSeries({ title: 'Benchmark', color: '#f59e0b', lineWidth: 2 });
+
+    const drawdownChart = createChart(drawdownBox, { ...chartOptions, height: 170 });
+    const drawdownSeries = drawdownChart.addAreaSeries({
+      title: 'Drawdown',
+      lineColor: '#fb7185',
+      topColor: 'rgba(251, 113, 133, 0.18)',
+      bottomColor: 'rgba(251, 113, 133, 0.02)',
+      lineWidth: 2,
+      priceFormat: { type: 'percent' },
     });
-
-    const equitySeries = equityChart.addLineSeries({
-      title: "Strategy Equity",
-      color: "#67e8f9",
-      lineWidth: 2,
-    }) as ISeriesApi<"Line">;
-
-    const benchmarkSeries = equityChart.addLineSeries({
-      title: "Buy & Hold",
-      color: "#fbbf24",
-      lineWidth: 2,
-    }) as ISeriesApi<"Line">;
 
     priceChartRef.current = priceChart;
     equityChartRef.current = equityChart;
+    drawdownChartRef.current = drawdownChart;
     candleSeriesRef.current = candleSeries;
     equitySeriesRef.current = equitySeries;
     benchmarkSeriesRef.current = benchmarkSeries;
+    drawdownSeriesRef.current = drawdownSeries;
+
+    const syncRange = () => {
+      const range = priceChart.timeScale().getVisibleLogicalRange();
+      if (range) {
+        equityChart.timeScale().setVisibleLogicalRange(range);
+        drawdownChart.timeScale().setVisibleLogicalRange(range);
+      }
+    };
+    priceChart.timeScale().subscribeVisibleLogicalRangeChange(syncRange);
 
     return () => {
+      priceChart.timeScale().unsubscribeVisibleLogicalRangeChange(syncRange);
       priceChart.remove();
       equityChart.remove();
-
+      drawdownChart.remove();
       priceChartRef.current = null;
       equityChartRef.current = null;
+      drawdownChartRef.current = null;
       candleSeriesRef.current = null;
       equitySeriesRef.current = null;
       benchmarkSeriesRef.current = null;
+      drawdownSeriesRef.current = null;
     };
-  }, [chartData, safeData.candles.length]);
+  }, []);
 
-  useEffect(() => {
-    if (!candleSeriesRef.current || safeData.candles.length === 0) {
-      return;
-    }
+  const applyRange = useCallback((index: number, reset = false, follow = false) => {
+    const candleSeries = candleSeriesRef.current;
+    if (!candleSeries) return;
 
-    const visibleCandles = safeData.candles.slice(0, visibleIndex);
-    const lastTime = Number(visibleCandles.at(-1)?.time ?? 0);
-    const visibleEquity = safeData.equityCurve.filter((point) => Number(point.time) <= lastTime);
-    const visibleBenchmark = safeData.benchmarkCurve.filter((point) => Number(point.time) <= lastTime);
-    const visibleMarkers = safeData.markers.filter((marker) => Number(marker.time) <= lastTime);
+    const safeIndex = Math.min(Math.max(index, 0), prepared.candles.length);
+    const previousIndex = renderedIndexRef.current;
+    const shouldReset = reset || previousIndex <= 0 || safeIndex <= previousIndex || safeIndex - previousIndex > RESET_JUMP_THRESHOLD;
 
     try {
-      candleSeriesRef.current.setData(visibleCandles);
-      equitySeriesRef.current?.setData(visibleEquity);
-      benchmarkSeriesRef.current?.setData(visibleBenchmark);
-      candleSeriesRef.current.setMarkers(markersVisible ? visibleMarkers : []);
-      priceChartRef.current?.timeScale().scrollToPosition(4, false);
-      equityChartRef.current?.timeScale().scrollToPosition(4, false);
+      if (shouldReset) {
+        resetSeriesToIndex(safeIndex);
+      } else {
+        for (let i = previousIndex; i < safeIndex; i += 1) {
+          candleSeries.update(toChartCandle(prepared.candles[i]));
+        }
+        const lastTime = lastCandleTime(prepared.candles, safeIndex);
+        updateLineUntil(equitySeriesRef.current, prepared.equity, 'equity', lastTime);
+        updateLineUntil(benchmarkSeriesRef.current, prepared.benchmark, 'benchmark', lastTime);
+        updateLineUntil(drawdownSeriesRef.current, prepared.drawdown, 'drawdown', lastTime);
+        candleSeries.setMarkers(markersUntil(lastTime));
+        renderedIndexRef.current = safeIndex;
+      }
+
+      if (reset) priceChartRef.current?.timeScale().fitContent();
+      if (follow) followReplayTail(safeIndex);
+      setChartError(null);
     } catch (error) {
-      console.error("Failed to render chart data", error);
-      setChartError(error instanceof Error ? error.message : "Failed to render chart.");
+      console.error(error);
+      setChartError(error instanceof Error ? error.message : 'Could not render chart data.');
     }
-  }, [
-    visibleIndex,
-    markersVisible,
-    safeData.candles,
-    safeData.equityCurve,
-    safeData.benchmarkCurve,
-    safeData.markers,
-  ]);
+  }, [markersUntil, prepared.benchmark, prepared.candles, prepared.drawdown, prepared.equity]);
+
+  function resetSeriesToIndex(index: number) {
+    const lastTime = lastCandleTime(prepared.candles, index);
+    candleSeriesRef.current?.setData(prepared.candles.slice(0, index).map(toChartCandle));
+
+    const equityEnd = upperBoundPoints(prepared.equity, lastTime);
+    const benchmarkEnd = upperBoundPoints(prepared.benchmark, lastTime);
+    const drawdownEnd = upperBoundPoints(prepared.drawdown, lastTime);
+    equitySeriesRef.current?.setData(prepared.equity.slice(0, equityEnd).map(toChartPoint));
+    benchmarkSeriesRef.current?.setData(prepared.benchmark.slice(0, benchmarkEnd).map(toChartPoint));
+    drawdownSeriesRef.current?.setData(prepared.drawdown.slice(0, drawdownEnd).map(toChartPoint));
+    lineCursorRef.current = { equity: equityEnd, benchmark: benchmarkEnd, drawdown: drawdownEnd };
+    candleSeriesRef.current?.setMarkers(markersUntil(lastTime));
+    renderedIndexRef.current = index;
+  }
+
+  function updateLineUntil(series: ISeriesApi<'Line'> | ISeriesApi<'Area'> | null, points: PreparedLinePoint[], key: LineCursorKey, maxTime: number) {
+    if (!series) return;
+    let cursor = lineCursorRef.current[key];
+    while (cursor < points.length && Number(points[cursor].time) <= maxTime) {
+      series.update(toChartPoint(points[cursor]));
+      cursor += 1;
+    }
+    lineCursorRef.current[key] = cursor;
+  }
+
+  useEffect(() => {
+    if (!prepared.candles.length) return;
+    applyRange(replayIndex, true);
+  }, [applyRange, prepared.candles.length]);
+
+  useEffect(() => {
+    const lastTime = lastCandleTime(prepared.candles, replayIndex);
+    candleSeriesRef.current?.setMarkers(markersUntil(lastTime));
+  }, [markersUntil, replayIndex, prepared.candles]);
 
   useEffect(() => {
     equitySeriesRef.current?.applyOptions({ visible: equityVisible });
     benchmarkSeriesRef.current?.applyOptions({ visible: equityVisible });
-
-    if (containerRef.current) {
-      const equityBox = containerRef.current.querySelector(".chart-equity-box") as HTMLElement | null;
-      if (equityBox) {
-        equityBox.style.display = equityVisible ? "block" : "none";
-      }
-    }
+    if (equityBoxRef.current) equityBoxRef.current.hidden = !equityVisible;
   }, [equityVisible]);
+
+  useEffect(() => {
+    drawdownSeriesRef.current?.applyOptions({ visible: drawdownVisible });
+    if (drawdownBoxRef.current) drawdownBoxRef.current.hidden = !drawdownVisible;
+  }, [drawdownVisible]);
+
+  useEffect(() => {
+    if (!isReplaying || prepared.candles.length === 0) return;
+    let raf = 0;
+
+    const frame = (time: number) => {
+      const state = replayRef.current;
+      const delta = state.lastFrame === 0 ? 16 : Math.min(120, time - state.lastFrame);
+      state.lastFrame = time;
+      state.remainder += (delta / 100) * replaySpeed;
+      const steps = Math.floor(state.remainder);
+
+      if (steps > 0) {
+        state.remainder -= steps;
+        const next = Math.min(state.index + steps, prepared.candles.length);
+        applyRange(next, false,true);
+        state.index = next;
+        setReplayIndex(next);
+
+        if (next >= prepared.candles.length) {
+          setIsReplaying(false);
+          return;
+        }
+      }
+
+      raf = window.requestAnimationFrame(frame);
+    };
+
+    raf = window.requestAnimationFrame(frame);
+    return () => window.cancelAnimationFrame(raf);
+  }, [applyRange, isReplaying, prepared.candles.length, replaySpeed]);
 
   function fitCharts() {
     priceChartRef.current?.timeScale().fitContent();
     equityChartRef.current?.timeScale().fitContent();
+    drawdownChartRef.current?.timeScale().fitContent();
   }
 
-  function zoomChart(multiplier: number) {
-    const chart = priceChartRef.current;
-    if (!chart) return;
-
-    const range = chart.timeScale().getVisibleLogicalRange();
+  function zoom(multiplier: number) {
+    const range = priceChartRef.current?.timeScale().getVisibleLogicalRange();
     if (!range) return;
-
     const center = (range.from + range.to) / 2;
-    const halfSize = ((range.to - range.from) / 2) * multiplier;
-
-    chart.timeScale().setVisibleLogicalRange({
-      from: center - halfSize,
-      to: center + halfSize,
-    });
+    const half = ((range.to - range.from) / 2) * multiplier;
+    priceChartRef.current?.timeScale().setVisibleLogicalRange({ from: center - half, to: center + half });
   }
 
-  function goToLatest() {
-    setReplayIndex(safeData.candles.length);
+  function followReplayTail(index: number) {
+      if (!priceChartRef.current || index <= 0) return;
+
+      const to = index + FOLLOW_RIGHT_OFFSET;
+      const from = Math.max(0, to - FOLLOW_VISIBLE_BARS);
+
+      priceChartRef.current.timeScale().setVisibleLogicalRange({ from, to });
+      equityChartRef.current?.timeScale().setVisibleLogicalRange({ from, to });
+      drawdownChartRef.current?.timeScale().setVisibleLogicalRange({ from, to });
+    }
+
+  function goLatest() {
+    const last = prepared.candles.length;
+    replayRef.current.index = last;
+    setReplayIndex(last);
+    applyRange(last, true,true);
     priceChartRef.current?.timeScale().scrollToRealTime();
-    equityChartRef.current?.timeScale().scrollToRealTime();
   }
 
   function resetReplay() {
+    const start = Math.min(INITIAL_BARS, Math.max(1, prepared.candles.length));
+    replayRef.current = { index: start, lastFrame: 0, remainder: 0 };
+    setReplayIndex(start);
     setIsReplaying(false);
-    setReplayIndex(Math.min(INITIAL_REPLAY_BARS, Math.max(1, safeData.candles.length)));
-    fitCharts();
+    applyRange(start, true,true);
   }
 
   function stepReplay() {
-    setReplayIndex((current) => Math.min(current + 1, safeData.candles.length));
+    const next = Math.min(replayRef.current.index + 1, prepared.candles.length);
+    replayRef.current.index = next;
+    setReplayIndex(next);
+    applyRange(next, false,true);
   }
 
-  function downloadScreenshot() {
-    const chart = priceChartRef.current;
-    const canvas = chart?.takeScreenshot();
+  function toggleReplay() {
+    replayRef.current.lastFrame = 0;
+    setIsReplaying((value) => !value);
+  }
 
-    if (!canvas) {
-      return;
-    }
-
-    const url = canvas.toDataURL("image/png");
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "backtest-chart.png";
+  function screenshot() {
+    const canvas = priceChartRef.current?.takeScreenshot();
+    if (!canvas) return;
+    const link = document.createElement('a');
+    link.href = canvas.toDataURL('image/png');
+    link.download = 'quant-chart.png';
     link.click();
   }
 
   if (!chartData) {
     return (
-      <section className="empty-chart">
+      <section className="panel empty-chart">
         <h2>No chart loaded</h2>
-        <p>Select a report or run a backtest to visualize candles and trades.</p>
+        <p>Select a run to load candles, trades, replay, equity and drawdown.</p>
       </section>
     );
   }
 
   return (
-    <section className="chart-shell">
+    <section className="panel chart-shell">
       <ChartToolbar
-        title="Backtest Replay Chart"
-        markersVisible={markersVisible}
+        title={title}
+        subtitle={`${prepared.candles.length.toLocaleString()} candles · ${prepared.markers.length.toLocaleString()} trade markers`}
+        markerMode={markerMode}
         equityVisible={equityVisible}
+        drawdownVisible={drawdownVisible}
         isReplaying={isReplaying}
-        replayProgress={replayProgress}
+        replayProgress={progress}
         replaySpeed={replaySpeed}
         onFit={fitCharts}
-        onZoomIn={() => zoomChart(0.7)}
-        onZoomOut={() => zoomChart(1.3)}
-        onGoToLatest={goToLatest}
-        onToggleMarkers={() => setMarkersVisible((value) => !value)}
+        onZoomIn={() => zoom(0.72)}
+        onZoomOut={() => zoom(1.28)}
+        onGoToLatest={goLatest}
+        onMarkerModeChange={setMarkerMode}
         onToggleEquity={() => setEquityVisible((value) => !value)}
-        onScreenshot={downloadScreenshot}
-        onReplayPlayPause={() => setIsReplaying((value) => !value)}
+        onToggleDrawdown={() => setDrawdownVisible((value) => !value)}
+        onScreenshot={screenshot}
+        onReplayPlayPause={toggleReplay}
         onReplayReset={resetReplay}
         onReplayStep={stepReplay}
         onReplaySpeedChange={setReplaySpeed}
       />
-
-      <div className="replay-progress-track">
-        <div className="replay-progress-bar" style={{ width: `${replayProgress}%` }} />
-      </div>
-
-      {chartError && (
-        <div className="error-box">
-          <strong>Chart data was invalid.</strong>
-          <p>{chartError}</p>
-        </div>
-      )}
-
+      <div className="progress-track"><div style={{ width: `${progress}%` }} /></div>
+      {chartError && <div className="notice error"><strong>Chart error</strong><p>{chartError}</p></div>}
       <section ref={containerRef} className="charts" />
     </section>
   );
 }
 
-function sanitizeCandles(points: ChartDataResponse["candles"] | undefined): SafeCandle[] {
-  const byTime = new Map<number, SafeCandle>();
-
-  for (const point of points ?? []) {
-    const time = toSafeUnixTime(point?.time);
-    const open = toFiniteNumber(point?.open);
-    const high = toFiniteNumber(point?.high);
-    const low = toFiniteNumber(point?.low);
-    const close = toFiniteNumber(point?.close);
-
-    if (time === null || open === null || high === null || low === null || close === null) {
-      continue;
-    }
-
-    const normalizedHigh = Math.max(high, open, close, low);
-    const normalizedLow = Math.min(low, open, close, high);
-    const existing = byTime.get(time);
-
-    if (!existing) {
-      byTime.set(time, {
-        time: time as Time,
-        open,
-        high: normalizedHigh,
-        low: normalizedLow,
-        close,
-      });
-      continue;
-    }
-
-    byTime.set(time, {
-      time: time as Time,
-      open: existing.open,
-      high: Math.max(existing.high, normalizedHigh),
-      low: Math.min(existing.low, normalizedLow),
-      close,
-    });
-  }
-
-  return [...byTime.values()].sort((left, right) => Number(left.time) - Number(right.time));
+function toChartCandle(point: PreparedCandle) {
+  return { time: point.time as Time, open: point.open, high: point.high, low: point.low, close: point.close };
 }
 
-function sanitizeLinePoints(points: ChartDataResponse["equity_curve"] | undefined): SafeLinePoint[] {
-  const byTime = new Map<number, SafeLinePoint>();
-
-  for (const point of points ?? []) {
-    const time = toSafeUnixTime(point?.time);
-    const value = toFiniteNumber(point?.value);
-
-    if (time === null || value === null) {
-      continue;
-    }
-
-    byTime.set(time, {
-      time: time as Time,
-      value,
-    });
-  }
-
-  return [...byTime.values()].sort((left, right) => Number(left.time) - Number(right.time));
+function toChartPoint(point: PreparedLinePoint) {
+  return { time: point.time as Time, value: point.value };
 }
 
-// ----------------------------------------------------------------------------
-// FIXED: Using reduce prevents TS2322, TS2677, and TS18047 by building a
-// perfectly typed array of SeriesMarker<Time> without nulls or map/filter chaining.
-// ----------------------------------------------------------------------------
-function sanitizeMarkers(inputMarkers: SeriesMarker<Time>[]): SeriesMarker<Time>[] {
-  return inputMarkers
-    .reduce<SeriesMarker<Time>[]>((validMarkers, marker) => {
-      const time = toSafeUnixTime(marker.time as number);
-
-      // Only push valid elements, completely avoiding 'null' in the array
-      if (time !== null) {
-        validMarkers.push({
-          ...marker,
-          time: time as Time,
-          // Properly type-cast text to 'string | undefined' to satisfy lightweight-charts
-          text: marker.text !== undefined ? String(marker.text) : undefined,
-        });
-      }
-
-      return validMarkers;
-    }, [])
-    .sort((left, right) => {
-      const timeDiff = Number(left.time) - Number(right.time);
-      if (timeDiff !== 0) return timeDiff;
-
-      // left and right are guaranteed to be valid markers here
-      return String(left.text ?? "").localeCompare(String(right.text ?? ""));
-    });
+function lastCandleTime(candles: PreparedCandle[], index: number): number {
+  if (candles.length === 0 || index <= 0) return 0;
+  return Number(candles[Math.min(index, candles.length) - 1]?.time ?? 0);
 }
 
-function toSafeUnixTime(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.floor(value);
+function upperBoundPoints(points: PreparedLinePoint[], maxTime: number): number {
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (Number(points[mid].time) <= maxTime) low = mid + 1;
+    else high = mid;
   }
-
-  if (typeof value === "string" && value.trim().length > 0) {
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) {
-      return Math.floor(numeric);
-    }
-
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) {
-      return Math.floor(parsed / 1000);
-    }
-  }
-
-  return null;
+  return low;
 }
 
-function toFiniteNumber(value: unknown): number | null {
-  const numeric = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(numeric) ? numeric : null;
+function upperBoundMarkers(markers: Array<{ time: number }>, maxTime: number): number {
+  let low = 0;
+  let high = markers.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (Number(markers[mid].time) <= maxTime) low = mid + 1;
+    else high = mid;
+  }
+  return low;
 }

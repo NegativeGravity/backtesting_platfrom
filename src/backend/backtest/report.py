@@ -31,9 +31,10 @@ class BacktestReportWriter:
         self._write_json(run_dir / "summary.json", summary)
         self._write_json(run_dir / "config_snapshot.json", config_snapshot)
 
+        trade_records = self._records_from_items(trades)
         self._write_csv(
             path=run_dir / "trades.csv",
-            records=self._records_from_items(trades),
+            records=trade_records,
             fallback_columns=[
                 "trade_id",
                 "symbol",
@@ -53,6 +54,7 @@ class BacktestReportWriter:
                 "side",
             ],
         )
+        self._write_parquet(run_dir / "trades.parquet", trade_records)
 
         self._write_csv(
             path=run_dir / "execution_log.csv",
@@ -125,6 +127,9 @@ class BacktestReportWriter:
 
         frame = frame.reindex(columns=list(dict.fromkeys([*fallback_columns, *frame.columns])))
         frame.to_csv(path, index=False)
+
+    def _write_parquet(self, path: Path, records: list[dict[str, Any]]) -> None:
+        pd.DataFrame(records).to_parquet(path, index=False)
 
     def _write_frame_or_records(
         self,

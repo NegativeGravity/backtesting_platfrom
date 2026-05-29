@@ -47,7 +47,10 @@ class OpenPosition:
 
     @property
     def unrealized_pnl(self) -> float:
-        return self.gross_unrealized_pnl - self.entry_fee - self.entry_slippage_cost
+        # Slippage is already embedded in entry_price/current fill prices.
+        # Entry fees are paid from free cash at execution time, so subtracting
+        # them here would double-count fees in portfolio equity.
+        return self.gross_unrealized_pnl
 
     @property
     def unrealized_return_pct(self) -> float:
@@ -154,12 +157,10 @@ def build_closed_position(
         exit_price=exit_price,
         quantity=position.quantity,
     )
-    total_costs = (
-        position.entry_fee
-        + exit_fee
-        + position.entry_slippage_cost
-        + exit_slippage_cost
-    )
+    # Accounting model A: slippage is represented by adverse fill prices.
+    # Keep slippage_cost as attribution/diagnostics only; do not subtract it
+    # again from realized PnL.
+    total_costs = position.entry_fee + exit_fee
     net_pnl = gross_pnl - total_costs
     return_pct = 0.0 if position.notional <= 0 else net_pnl / position.notional
 

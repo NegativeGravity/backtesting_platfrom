@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.core.config import AppConfig
-from backend.core.paths import resolve_project_path
+from backend.core.paths import resolve_model_artifact_path
 from backend.strategy.adaptive_trend_breakout import AdaptiveTrendBreakoutStrategy
 from backend.strategy.dl_temporal_fusion_momentum import DLTemporalFusionMomentumStrategy
 from backend.strategy.liquidity_sweep_reversal import LiquiditySweepReversalStrategy
@@ -133,7 +133,7 @@ def _resolve_required_artifact(
     artifact_path = model_artifact_path or getattr(config.ml, "model_artifact_path", None)
     if artifact_path is None or not str(artifact_path).strip():
         raise ValueError(f"model_artifact_path is required for {strategy_name}.")
-    return resolve_project_path(artifact_path)
+    return resolve_model_artifact_path(artifact_path)
 
 
 def _get_strategy_parameter(config: AppConfig, key: str, default: Any) -> Any:

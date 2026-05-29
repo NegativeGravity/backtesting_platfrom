@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import queue
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -13,11 +14,12 @@ from backend.backtest.benchmark import build_buy_and_hold_benchmark
 from backend.backtest.metrics import calculate_metrics
 from backend.backtest.report import BacktestReportWriter
 from backend.core.config import load_config
-from backend.core.paths import resolve_project_path
+from backend.core.paths import resolve_model_artifact_path
 from backend.core.time import timestamp_for_run_id
 from backend.data.validator import validate_ohlcv
 from backend.engine.bot_worker import run_bot_worker
 from backend.engine.messages import BotCommand, BotResponse
+from backend.engine.shared_market import SharedMarketDataOwner
 from backend.engine.positions import (
     ClosedPosition,
     OpenPosition,
@@ -79,6 +81,10 @@ class EquityPoint:
     position_market_value: float
     equity: float
     drawdown: float
+    reserved_margin: float = 0.0
+    gross_unrealized_pnl: float = 0.0
+    available_capital: float = 0.0
+    accounting_model: str = "collateral_based"
 
 
 @dataclass
@@ -104,16 +110,13 @@ class LiveReplayResult:
 
 
 class LiveReplayEngine:
-    CAPITAL_PER_TRADE_FRACTION = 0.10
-    DEFAULT_STOP_LOSS_PCT = 0.02
-    DEFAULT_TAKE_PROFIT_PCT = 0.04
-
     def __init__(
         self,
         config_path: str,
         robot_specs: list[LiveRobotSpec],
         replay_delay_seconds: float = 0.0,
         event_callback: EventCallback | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self._config_path = config_path
         self._config = load_config(config_path)
@@ -139,8 +142,13 @@ class LiveReplayEngine:
         self._robot_specs = robot_specs
         self._replay_delay_seconds = replay_delay_seconds
         self._event_callback = event_callback
+        self._stop_event = stop_event or threading.Event()
+        self._capital_fraction = min(max(float(self._config.risk.max_position_notional_pct), 0.0), 1.0)
+        self._stop_loss_pct = max(float(self._config.risk.stop_distance_pct), 0.0)
+        self._take_profit_pct = max(self._stop_loss_pct * 2.0, self._stop_loss_pct)
         self._session_id = f"live_{timestamp_for_run_id()}"
         self._robot_runtimes: dict[str, LiveRobotRuntime] = {}
+        self._shared_market: SharedMarketDataOwner | None = None
 
     def run(self) -> LiveReplayResult:
         self._emit(
@@ -149,11 +157,12 @@ class LiveReplayEngine:
             payload={
                 "session_id": self._session_id,
                 "execution_model": "signal_on_current_bar_fill_at_next_open",
-                "capital_model": "shared_robot_capital_10_percent_entry_cancel_if_insufficient",
+                "capital_model": "collateral_based_free_cash_plus_reserved_margin_plus_gross_unrealized_pnl",
+                "slippage_model": "embedded_in_fill_price_not_subtracted_from_pnl",
                 "position_model": "worker_owned_long_short_positions",
-                "capital_per_trade_fraction": self.CAPITAL_PER_TRADE_FRACTION,
-                "default_stop_loss_pct": self.DEFAULT_STOP_LOSS_PCT,
-                "default_take_profit_pct": self.DEFAULT_TAKE_PROFIT_PCT,
+                "capital_per_trade_fraction": self._capital_fraction,
+                "default_stop_loss_pct": self._stop_loss_pct,
+                "default_take_profit_pct": self._take_profit_pct,
                 "robots": [
                     {
                         "robot_id": robot.robot_id,
@@ -179,9 +188,12 @@ class LiveReplayEngine:
         )
 
         try:
-            self._start_strategy_workers()
+            self._start_strategy_workers(data)
 
             for index in range(len(data)):
+                if self._stop_event.is_set():
+                    break
+
                 current_bar = data.iloc[index]
                 current_close = float(current_bar["close"])
 
@@ -218,13 +230,13 @@ class LiveReplayEngine:
                         bar=current_bar,
                     )
 
-                    market_window = data.iloc[: index + 1].copy()
-                    self._send_market_window_to_robot_workers(
+                    self._send_bar_index_to_robot_workers(
                         robot_runtime=robot_runtime,
-                        market_window=market_window,
+                        bar_index=index,
+                        current_close=current_close,
                     )
 
-                self._process_worker_responses(block=True, timeout=1.0)
+                self._process_worker_responses_for(max_wait_seconds=0.005)
 
                 if self._replay_delay_seconds > 0:
                     time.sleep(self._replay_delay_seconds)
@@ -238,6 +250,7 @@ class LiveReplayEngine:
 
         finally:
             self._stop_strategy_workers()
+            self._close_shared_market()
             self._emit(
                 EventType.ENGINE_STOPPED,
                 source="live_replay_engine",
@@ -258,7 +271,10 @@ class LiveReplayEngine:
 
         return data
 
-    def _start_strategy_workers(self) -> None:
+    def _start_strategy_workers(self, data: pd.DataFrame) -> None:
+        self._shared_market = SharedMarketDataOwner.from_frame(data)
+        shared_market_descriptor = self._shared_market.descriptor()
+
         for robot_spec in self._robot_specs:
             worker_runtimes: dict[str, StrategyWorkerRuntime] = {}
 
@@ -275,7 +291,7 @@ class LiveReplayEngine:
                             "but model_artifact_path is missing."
                         )
 
-                    model_path = str(resolve_project_path(worker_spec.model_artifact_path))
+                    model_path = str(resolve_model_artifact_path(worker_spec.model_artifact_path))
 
                 process = mp.Process(
                     target=run_bot_worker,
@@ -286,6 +302,7 @@ class LiveReplayEngine:
                         "model_artifact_path": model_path,
                         "command_queue": command_queue,
                         "response_queue": response_queue,
+                        "shared_market_descriptor": shared_market_descriptor,
                     },
                     daemon=True,
                 )
@@ -313,7 +330,7 @@ class LiveReplayEngine:
         for robot_runtime in self._robot_runtimes.values():
             for worker_runtime in robot_runtime.strategy_workers.values():
                 try:
-                    worker_runtime.command_queue.put(
+                    worker_runtime.command_queue.put_nowait(
                         BotCommand(command_type="STOP", payload={})
                     )
                 except Exception:
@@ -330,12 +347,12 @@ class LiveReplayEngine:
                     worker_runtime.process.terminate()
                     worker_runtime.process.join(timeout=3)
 
-    def _send_market_window_to_robot_workers(
+    def _send_bar_index_to_robot_workers(
         self,
         robot_runtime: LiveRobotRuntime,
-        market_window: pd.DataFrame,
+        bar_index: int,
+        current_close: float,
     ) -> None:
-        current_close = float(market_window.iloc[-1]["close"])
         robot_equity = self._calculate_robot_equity(robot_runtime)
         available_capital = self._calculate_available_robot_capital(robot_runtime)
 
@@ -347,7 +364,7 @@ class LiveReplayEngine:
             )
 
             payload = {
-                "market_window": self._serialize_market_window(market_window),
+                "bar_index": bar_index,
                 "portfolio": {
                     "symbol": self._config.data.symbol,
                     "position_quantity": 0.0 if active_position is None else active_position.quantity,
@@ -358,21 +375,34 @@ class LiveReplayEngine:
                     "unrealized_pnl": None if active_position is None else active_position.unrealized_pnl,
                     "robot_equity": robot_equity,
                     "robot_available_capital": available_capital,
+                    "bar_index": bar_index,
                 },
             }
 
-            worker_runtime.command_queue.put(
-                BotCommand(
-                    command_type="MARKET_WINDOW",
-                    payload=payload,
+            try:
+                worker_runtime.command_queue.put_nowait(
+                    BotCommand(command_type="BAR_INDEX", payload=payload)
                 )
-            )
+            except queue.Full:
+                self._emit(
+                    EventType.SYSTEM_ALERT,
+                    source="live_replay_engine",
+                    payload={
+                        "robot_id": robot_runtime.robot_id,
+                        "robot_name": robot_runtime.display_name,
+                        "worker_id": worker_runtime.worker_id,
+                        "strategy": worker_runtime.strategy_name,
+                        "reason": "worker_command_queue_full_bar_skipped",
+                        "bar_index": bar_index,
+                    },
+                )
 
     def _process_worker_responses(
         self,
-        block: bool,
+        block: bool = False,
         timeout: float = 0.0,
-    ) -> None:
+    ) -> int:
+        processed = 0
         for robot_runtime in self._robot_runtimes.values():
             for worker_runtime in robot_runtime.strategy_workers.values():
                 while True:
@@ -389,9 +419,26 @@ class LiveReplayEngine:
                         worker_runtime=worker_runtime,
                         response=response,
                     )
+                    processed += 1
 
                     if block:
                         break
+        return processed
+
+    def _process_worker_responses_for(self, max_wait_seconds: float) -> int:
+        deadline = time.perf_counter() + max(0.0, max_wait_seconds)
+        processed = self._process_worker_responses(block=False)
+        while time.perf_counter() < deadline:
+            batch = self._process_worker_responses(block=False)
+            processed += batch
+            if batch == 0:
+                time.sleep(0.0005)
+        return processed
+
+    def _close_shared_market(self) -> None:
+        if self._shared_market is not None:
+            self._shared_market.close()
+            self._shared_market = None
 
     def _handle_worker_response(
         self,
@@ -519,7 +566,7 @@ class LiveReplayEngine:
                     signal_time=signal.timestamp,
                     reason=signal.reason,
                 ),
-                target_notional_fraction=self.CAPITAL_PER_TRADE_FRACTION,
+                target_notional_fraction=self._capital_fraction,
                 current_price=current_price,
             )
             return
@@ -544,7 +591,7 @@ class LiveReplayEngine:
                     signal_time=signal.timestamp,
                     reason=signal.reason,
                 ),
-                target_notional_fraction=self.CAPITAL_PER_TRADE_FRACTION,
+                target_notional_fraction=self._capital_fraction,
                 current_price=current_price,
             )
             return
@@ -638,10 +685,21 @@ class LiveReplayEngine:
 
             if is_open_order:
                 robot_equity = self._calculate_robot_equity(robot_runtime)
-                target_notional = robot_equity * pending.target_notional_fraction
                 available_capital = self._calculate_available_robot_capital(robot_runtime)
+                risk_amount = robot_equity * self._config.risk.risk_per_trade_pct
+                stop_distance_pct = max(self._config.risk.stop_distance_pct, 1e-9)
+                stop_based_notional = risk_amount / stop_distance_pct
+                risk_notional = robot_equity * self._config.risk.max_position_notional_pct
+                min_cash_reserve = robot_equity * self._config.risk.min_cash_pct
+                deployable_capital = max(0.0, available_capital - min_cash_reserve)
+                target_notional = min(
+                    robot_equity * pending.target_notional_fraction,
+                    stop_based_notional,
+                    risk_notional,
+                    deployable_capital,
+                )
 
-                if available_capital < target_notional:
+                if target_notional < self._config.risk.min_order_notional or available_capital < target_notional:
                     self._record_cancelled_order(
                         robot_runtime=robot_runtime,
                         pending=pending,
@@ -702,7 +760,7 @@ class LiveReplayEngine:
             }
 
             if order.action == OrderAction.BUY_TO_OPEN:
-                robot_runtime.cash -= quantity * fill_price + fee + slippage_cost
+                robot_runtime.cash -= self._entry_required_cash(quantity, fill_price, fee)
                 self._open_position(
                     robot_runtime=robot_runtime,
                     pending=pending,
@@ -715,7 +773,7 @@ class LiveReplayEngine:
                 )
 
             elif order.action == OrderAction.SELL_TO_OPEN:
-                robot_runtime.cash -= quantity * fill_price + fee + slippage_cost
+                robot_runtime.cash -= self._entry_required_cash(quantity, fill_price, fee)
                 self._open_position(
                     robot_runtime=robot_runtime,
                     pending=pending,
@@ -768,11 +826,11 @@ class LiveReplayEngine:
         order = pending.order
 
         if side == PositionSide.LONG:
-            stop_loss = fill_price * (1.0 - self.DEFAULT_STOP_LOSS_PCT)
-            take_profit = fill_price * (1.0 + self.DEFAULT_TAKE_PROFIT_PCT)
+            stop_loss = fill_price * (1.0 - self._stop_loss_pct)
+            take_profit = fill_price * (1.0 + self._take_profit_pct)
         else:
-            stop_loss = fill_price * (1.0 + self.DEFAULT_STOP_LOSS_PCT)
-            take_profit = fill_price * (1.0 - self.DEFAULT_TAKE_PROFIT_PCT)
+            stop_loss = fill_price * (1.0 + self._stop_loss_pct)
+            take_profit = fill_price * (1.0 - self._take_profit_pct)
 
         open_position = OpenPosition(
             position_id=f"{robot_runtime.robot_id}_{pending.worker_id}_{order.symbol}_{timestamp.isoformat()}",
@@ -827,7 +885,9 @@ class LiveReplayEngine:
             exit_reason=exit_reason,
         )
 
-        robot_runtime.cash += position.notional + closed_position.net_pnl
+        # Release reserved entry margin and realize PnL. Entry fees were paid
+        # from free cash at open; slippage is already included in fill prices.
+        robot_runtime.cash += position.notional + closed_position.gross_pnl - exit_fee
         robot_runtime.closed_positions.append(closed_position)
 
         self._emit(
@@ -950,7 +1010,9 @@ class LiveReplayEngine:
     ) -> None:
         timestamp = pd.Timestamp(bar["timestamp"])
         equity = self._calculate_robot_equity(robot_runtime)
-        position_market_value = self._calculate_committed_capital(robot_runtime)
+        position_market_value = self._calculate_exposure_notional(robot_runtime)
+        reserved_margin = self._calculate_reserved_margin(robot_runtime)
+        gross_unrealized_pnl = self._calculate_gross_unrealized_pnl(robot_runtime)
         available_capital = self._calculate_available_robot_capital(robot_runtime)
 
         robot_runtime.peak_equity = max(robot_runtime.peak_equity, equity)
@@ -963,6 +1025,9 @@ class LiveReplayEngine:
             position_market_value=position_market_value,
             equity=equity,
             drawdown=drawdown,
+            reserved_margin=reserved_margin,
+            gross_unrealized_pnl=gross_unrealized_pnl,
+            available_capital=available_capital,
         )
         robot_runtime.equity_curve.append(point)
 
@@ -976,7 +1041,10 @@ class LiveReplayEngine:
                 "cash": available_capital,
                 "equity": equity,
                 "drawdown": drawdown,
-                "committed_capital": position_market_value,
+                "committed_capital": reserved_margin,
+                "reserved_margin": reserved_margin,
+                "exposure_notional": position_market_value,
+                "gross_unrealized_pnl": gross_unrealized_pnl,
                 "available_capital": available_capital,
                 "open_positions": [
                     position.to_event_payload()
@@ -1019,11 +1087,12 @@ class LiveReplayEngine:
                 "strategy": "multi_strategy_robot",
                 "engine_mode": "live_replay_multiprocessing_next_bar_open",
                 "execution_model": "signal_on_current_bar_fill_at_next_open",
-                "capital_model": "shared_robot_capital_10_percent_entry_cancel_if_insufficient",
+                "capital_model": "collateral_based_free_cash_plus_reserved_margin_plus_gross_unrealized_pnl",
+                "slippage_model": "embedded_in_fill_price_not_subtracted_from_pnl",
                 "position_model": "worker_owned_long_short_positions",
-                "capital_per_trade_fraction": self.CAPITAL_PER_TRADE_FRACTION,
-                "default_stop_loss_pct": self.DEFAULT_STOP_LOSS_PCT,
-                "default_take_profit_pct": self.DEFAULT_TAKE_PROFIT_PCT,
+                "capital_per_trade_fraction": self._capital_fraction,
+                "default_stop_loss_pct": self._stop_loss_pct,
+                "default_take_profit_pct": self._take_profit_pct,
                 "strategy_workers": [
                     {
                         "worker_id": worker.worker_id,
@@ -1085,6 +1154,12 @@ class LiveReplayEngine:
 
         return fill_price, fee, slippage_cost
 
+    @staticmethod
+    def _entry_required_cash(quantity: float, fill_price: float, fee: float) -> float:
+        # Reserve entry notional/margin and pay fee from free cash.
+        # Slippage is represented by fill_price, not charged a second time.
+        return abs(quantity * fill_price) + fee
+
     def _get_execution_bps(
         self,
         *names: str,
@@ -1098,22 +1173,37 @@ class LiveReplayEngine:
         return default
 
     def _calculate_robot_equity(self, robot_runtime: LiveRobotRuntime) -> float:
-        unrealized = sum(
-            position.unrealized_pnl
+        return (
+            robot_runtime.cash
+            + self._calculate_reserved_margin(robot_runtime)
+            + self._calculate_gross_unrealized_pnl(robot_runtime)
+        )
+
+    def _calculate_reserved_margin(self, robot_runtime: LiveRobotRuntime) -> float:
+        return sum(
+            position.notional
             for position in robot_runtime.open_positions.values()
         )
-        return robot_runtime.cash + self._calculate_committed_capital(robot_runtime) + unrealized
 
-    def _calculate_committed_capital(self, robot_runtime: LiveRobotRuntime) -> float:
+    def _calculate_gross_unrealized_pnl(self, robot_runtime: LiveRobotRuntime) -> float:
+        return sum(
+            position.gross_unrealized_pnl
+            for position in robot_runtime.open_positions.values()
+        )
+
+    def _calculate_exposure_notional(self, robot_runtime: LiveRobotRuntime) -> float:
         return sum(
             position.current_notional
             for position in robot_runtime.open_positions.values()
         )
 
+    def _calculate_committed_capital(self, robot_runtime: LiveRobotRuntime) -> float:
+        return self._calculate_reserved_margin(robot_runtime)
+
     def _calculate_available_robot_capital(self, robot_runtime: LiveRobotRuntime) -> float:
         equity = self._calculate_robot_equity(robot_runtime)
-        committed = self._calculate_committed_capital(robot_runtime)
-        return max(equity - committed, 0.0)
+        reserve = equity * self._config.risk.min_cash_pct
+        return max(robot_runtime.cash - reserve, 0.0)
 
     def _get_worker_position(
         self,

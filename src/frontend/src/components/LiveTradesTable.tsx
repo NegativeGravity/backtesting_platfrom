@@ -1,237 +1,120 @@
-import type { LiveEvent } from "../api/liveApi";
-import type { LivePositionPayload } from "../types";
-import {
-  formatDateTime,
-  formatMoney,
-  formatNumber,
-  formatPercent,
-} from "../utils/formatters";
+import { useEffect, useRef, useState } from 'react';
+import type { LiveEvent, LivePositionPayload } from '../types';
+import { formatDateTime, formatMoney, formatNumber, formatPercent } from '../utils/formatters';
 
 interface LiveTradesTableProps {
   events: LiveEvent[];
 }
 
 export function LiveTradesTable({ events }: LiveTradesTableProps) {
-  const { openPositions, closedPositions } = buildPositionState(events);
+  const processedRef = useRef<Set<string>>(new Set());
+  const openRef = useRef<Map<string, LivePositionPayload>>(new Map());
+  const closedRef = useRef<Map<string, LivePositionPayload>>(new Map());
+  const [positions, setPositions] = useState(() => ({ openPositions: [] as LivePositionPayload[], closedPositions: [] as LivePositionPayload[] }));
+  const { openPositions, closedPositions } = positions;
+
+  useEffect(() => {
+    if (events.length === 0) {
+      processedRef.current.clear();
+      openRef.current.clear();
+      closedRef.current.clear();
+      setPositions({ openPositions: [], closedPositions: [] });
+      return;
+    }
+
+    const nextEvents = [...events].reverse().filter((event) => !processedRef.current.has(eventKey(event)));
+    if (nextEvents.length === 0) return;
+
+    let changed = false;
+    for (const event of nextEvents) {
+      processedRef.current.add(eventKey(event));
+      changed = applyPositionEvent(event, openRef.current, closedRef.current) || changed;
+    }
+
+    if (changed) {
+      setPositions({
+        openPositions: [...openRef.current.values()].reverse(),
+        closedPositions: [...closedRef.current.values()].reverse(),
+      });
+    }
+  }, [events]);
 
   return (
-    <section className="trade-blotter">
-      <div className="trade-blotter-header">
+    <section className="panel live-positions">
+      <div className="panel-head">
         <div>
-          <h2>Live Positions</h2>
-          <p>
-            Worker-owned long/short positions with live unrealized PnL and closed
-            trade results.
-          </p>
+          <span className="kicker">Live blotter</span>
+          <h2>Positions</h2>
+          <p>Open and closed positions reconstructed from websocket events.</p>
         </div>
-
-        <div className="trade-blotter-count">
-          <strong>{openPositions.length}</strong>
-          <span>open</span>
-        </div>
+        <span className="badge live">{openPositions.length} open</span>
       </div>
 
-      <div className="trade-stats-grid">
-        <StatTile label="Open" value={String(openPositions.length)} tone="neutral" />
-        <StatTile label="Closed" value={String(closedPositions.length)} tone="neutral" />
-        <StatTile
-          label="Unrealized"
-          value={formatMoney(
-            openPositions.reduce(
-              (sum, position) => sum + Number(position.unrealized_pnl ?? 0),
-              0,
-            ),
-          )}
-          tone={
-            openPositions.reduce(
-              (sum, position) => sum + Number(position.unrealized_pnl ?? 0),
-              0,
-            ) >= 0
-              ? "good"
-              : "bad"
-          }
-        />
-        <StatTile
-          label="Realized"
-          value={formatMoney(
-            closedPositions.reduce(
-              (sum, position) => sum + Number(position.net_pnl ?? 0),
-              0,
-            ),
-          )}
-          tone={
-            closedPositions.reduce(
-              (sum, position) => sum + Number(position.net_pnl ?? 0),
-              0,
-            ) >= 0
-              ? "good"
-              : "bad"
-          }
-        />
+      <div className="mini-grid">
+        <Stat label="Open" value={String(openPositions.length)} />
+        <Stat label="Closed" value={String(closedPositions.length)} />
+        <Stat label="Unrealized" value={formatMoney(openPositions.reduce((sum, p) => sum + Number(p.unrealized_pnl ?? 0), 0))} />
+        <Stat label="Realized" value={formatMoney(closedPositions.reduce((sum, p) => sum + Number(p.net_pnl ?? 0), 0))} />
       </div>
 
-      <div className="positions-section-title">Open Positions</div>
-
-      {openPositions.length === 0 ? (
-        <div className="trade-empty-state">
-          <strong>No open positions</strong>
-          <span>Positions will appear here after live orders are filled.</span>
-        </div>
-      ) : (
-        <div className="trade-list">
-          {openPositions.map((position, index) => (
-            <PositionCard
-              key={position.position_id}
-              position={position}
-              index={index}
-              closed={false}
-            />
-          ))}
-        </div>
-      )}
-
-      <div className="positions-section-title">Closed Positions</div>
-
-      {closedPositions.length === 0 ? (
-        <div className="trade-empty-state">
-          <strong>No closed positions yet</strong>
-          <span>Closed long/short positions will appear here.</span>
-        </div>
-      ) : (
-        <div className="trade-list">
-          {closedPositions.map((position, index) => (
-            <PositionCard
-              key={`${position.position_id}_closed`}
-              position={position}
-              index={index}
-              closed
-            />
-          ))}
-        </div>
-      )}
+      <h3>Open Positions</h3>
+      <PositionList positions={openPositions} closed={false} />
+      <h3>Closed Positions</h3>
+      <PositionList positions={closedPositions} closed />
     </section>
   );
 }
 
-function PositionCard({
-  position,
-  index,
-  closed,
-}: {
-  position: LivePositionPayload;
-  index: number;
-  closed: boolean;
-}) {
-  const pnl = closed
-    ? Number(position.net_pnl ?? 0)
-    : Number(position.unrealized_pnl ?? 0);
-
-  const pnlPct = closed
-    ? Number(position.return_pct ?? 0)
-    : Number(position.unrealized_return_pct ?? 0);
-
-  const resultStatus = pnl >= 0 ? "profit" : "loss";
-
+function PositionList({ positions, closed }: { positions: LivePositionPayload[]; closed: boolean }) {
+  if (positions.length === 0) return <div className="empty-state small">No {closed ? 'closed' : 'open'} positions.</div>;
   return (
-    <article className={`trade-row-card ${closed ? resultStatus : "open"}`}>
-      <div className="trade-row-index">{index + 1}</div>
-
-      <div className="trade-main-cell">
-        <div className="trade-symbol-line">
-          <strong>{position.symbol}</strong>
-          <span className={position.side === "LONG" ? "side-badge buy" : "side-badge sell"}>
-            {position.side}
-          </span>
-          <span className={`result-badge ${closed ? resultStatus : "open"}`}>
-            {closed ? formatMoney(pnl) : "OPEN"}
-          </span>
-        </div>
-
-        <div className="trade-meta-line">
-          <span>{position.robot_name}</span>
-          <span>{position.worker_id}</span>
-          <span>{position.strategy}</span>
-          {closed && position.exit_reason && <span>{position.exit_reason}</span>}
-        </div>
-      </div>
-
-      <div className="trade-detail-grid">
-        <InfoCell label="Entry" value={formatMoney(position.entry_price)} />
-        <InfoCell
-          label={closed ? "Exit" : "Current"}
-          value={formatMoney(closed ? position.exit_price : position.current_price)}
-        />
-        <InfoCell label="Quantity" value={formatNumber(position.quantity, 6)} />
-        <InfoCell label="PnL" value={formatMoney(pnl)} />
-        <InfoCell label="Return" value={formatPercent(pnlPct)} />
-        <InfoCell label="Stop Loss" value={formatMoney(position.stop_loss)} />
-        <InfoCell label="Take Profit" value={formatMoney(position.take_profit)} />
-        <InfoCell
-          label={closed ? "Exit Time" : "Entry Time"}
-          value={formatDateTime(closed ? position.exit_time : position.entry_time)}
-        />
-      </div>
-    </article>
-  );
-}
-
-function InfoCell({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="trade-info-cell">
-      <span>{label}</span>
-      <strong>{value}</strong>
+    <div className="position-list">
+      {positions.slice(0, 80).map((position) => {
+        const pnl = Number(closed ? position.net_pnl ?? 0 : position.unrealized_pnl ?? 0);
+        return (
+          <article key={`${position.position_id}-${closed ? 'closed' : 'open'}`} className="position-card">
+            <span><b>{position.symbol}</b><small>{position.position_id}</small></span>
+            <span className={`side-badge ${String(position.side).toLowerCase().includes('short') ? 'sell' : 'buy'}`}>{position.side}</span>
+            <span><b>{position.worker_id}</b><small>{position.strategy}</small></span>
+            <span><b>{formatMoney(position.entry_price)}</b><small>{formatDateTime(position.entry_time)}</small></span>
+            <span><b>{formatNumber(position.quantity, 6)}</b><small>quantity</small></span>
+            <span className={pnl >= 0 ? 'pos' : 'neg'}><b>{formatMoney(pnl)}</b><small>{formatPercent(closed ? position.return_pct : position.unrealized_return_pct)}</small></span>
+          </article>
+        );
+      })}
     </div>
   );
 }
 
-function StatTile({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone: "good" | "bad" | "neutral";
-}) {
-  return (
-    <div className={`trade-stat-tile ${tone}`}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
+function Stat({ label, value }: { label: string; value: string }) {
+  return <article className="stat-tile"><span>{label}</span><strong>{value}</strong></article>;
 }
 
-function buildPositionState(events: LiveEvent[]) {
-  const openMap = new Map<string, LivePositionPayload>();
-  const closedMap = new Map<string, LivePositionPayload>();
+function applyPositionEvent(event: LiveEvent, openMap: Map<string, LivePositionPayload>, closedMap: Map<string, LivePositionPayload>): boolean {
+  const payload = event.payload as unknown as LivePositionPayload;
+  if (!payload?.position_id) return false;
 
-  for (const event of [...events].reverse()) {
-    if (event.event_type === "POSITION_OPENED") {
-      const payload = event.payload as unknown as LivePositionPayload;
-      openMap.set(payload.position_id, payload);
-      closedMap.delete(payload.position_id);
-    }
-
-    if (event.event_type === "POSITION_UPDATED") {
-      const payload = event.payload as unknown as LivePositionPayload;
-
-      if (openMap.has(payload.position_id)) {
-        openMap.set(payload.position_id, {
-          ...openMap.get(payload.position_id)!,
-          ...payload,
-        });
-      }
-    }
-
-    if (event.event_type === "POSITION_CLOSED") {
-      const payload = event.payload as unknown as LivePositionPayload;
-      openMap.delete(payload.position_id);
-      closedMap.set(payload.position_id, payload);
-    }
+  if (event.event_type === 'POSITION_OPENED') {
+    openMap.set(payload.position_id, payload);
+    closedMap.delete(payload.position_id);
+    return true;
   }
 
-  return {
-    openPositions: [...openMap.values()].reverse(),
-    closedPositions: [...closedMap.values()].reverse(),
-  };
+  if (event.event_type === 'POSITION_UPDATED' && openMap.has(payload.position_id)) {
+    openMap.set(payload.position_id, { ...openMap.get(payload.position_id)!, ...payload });
+    return true;
+  }
+
+  if (event.event_type === 'POSITION_CLOSED') {
+    openMap.delete(payload.position_id);
+    closedMap.set(payload.position_id, payload);
+    return true;
+  }
+
+  return false;
+}
+
+function eventKey(event: LiveEvent): string {
+  if (event.event_id) return event.event_id;
+  return `${event.event_type}:${event.timestamp ?? ''}:${JSON.stringify(event.payload)}`;
 }

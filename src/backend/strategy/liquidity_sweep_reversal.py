@@ -2,28 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
+from backend.strategy.market_view import MarketDataView
 from backend.strategy.signals import Signal, SignalType
 
 
 class LiquiditySweepReversalStrategy:
-    """
-    Liquidity sweep / false-breakout reversal strategy.
-
-    It looks for stop-hunt style candles:
-    - Price sweeps the previous range high, rejects back below it, and closes with
-      a strong upper wick -> SHORT.
-    - Price sweeps the previous range low, rejects back above it, and closes with
-      a strong lower wick -> LONG.
-
-    Filters:
-    - ATR-normalized wick size.
-    - Optional volume z-score confirmation.
-    - Optional regime filter to avoid fading extremely strong trends.
-
-    No lookahead: previous range high/low are shifted by one bar.
-    """
+    """Liquidity sweep / false-breakout reversal strategy with cached indicators."""
 
     def __init__(
         self,
@@ -51,47 +38,39 @@ class LiquiditySweepReversalStrategy:
         self._exit_zscore = float(exit_zscore)
         self._max_holding_bars = int(max_holding_bars)
         self._min_bars = max(self._sweep_window, self._atr_window, self._volume_window, self._trend_ema) + 3
+        self.max_lookback = self._min_bars + self._max_holding_bars + 8
 
-    def generate_signal(self, market_window: pd.DataFrame, portfolio: Any) -> Signal:
-        timestamp = self._timestamp(market_window)
-
-        if len(market_window) < self._min_bars:
+    def generate_signal_at(self, market: MarketDataView, index: int, portfolio: Any) -> Signal:
+        timestamp = market.timestamp(index)
+        if index + 1 < self._min_bars:
             return self._hold(timestamp, "not_enough_history", {"required_bars": self._min_bars})
 
-        frame = market_window.tail(self._min_bars + self._max_holding_bars + 5).copy()
-        open_ = frame["open"].astype(float)
-        high = frame["high"].astype(float)
-        low = frame["low"].astype(float)
-        close = frame["close"].astype(float)
-        volume = frame["volume"].astype(float) if "volume" in frame else pd.Series(0.0, index=frame.index)
-
-        current_open = float(open_.iloc[-1])
-        current_high = float(high.iloc[-1])
-        current_low = float(low.iloc[-1])
-        current_close = float(close.iloc[-1])
+        current_open = market.open_at(index)
+        current_high = market.high_at(index)
+        current_low = market.low_at(index)
+        current_close = market.close_at(index)
         candle_range = max(current_high - current_low, 1e-12)
         body_high = max(current_open, current_close)
         body_low = min(current_open, current_close)
         upper_wick = current_high - body_high
         lower_wick = body_low - current_low
 
-        prev_range_high = float(high.rolling(self._sweep_window).max().shift(1).iloc[-1])
-        prev_range_low = float(low.rolling(self._sweep_window).min().shift(1).iloc[-1])
-        atr = self._atr(high, low, close, self._atr_window)
-        current_atr = float(atr.iloc[-1])
-        trend = close.ewm(span=self._trend_ema, adjust=False).mean()
-        trend_now = float(trend.iloc[-1])
+        prev_range_high = float(market.rolling_max("high", self._sweep_window, shift=1)[index])
+        prev_range_low = float(market.rolling_min("low", self._sweep_window, shift=1)[index])
+        atr = market.atr(self._atr_window)
+        current_atr = float(atr[index])
+        trend_now = float(market.ema("close", self._trend_ema)[index])
         trend_distance_atr = abs(current_close - trend_now) / current_atr if current_atr > 0 else 999.0
-
-        volume_mean = volume.rolling(self._volume_window).mean()
-        volume_std = volume.rolling(self._volume_window).std(ddof=0)
-        volume_z = float(((volume - volume_mean) / volume_std.replace(0.0, pd.NA)).iloc[-1])
-        if pd.isna(volume_z):
+        volume_std = float(market.rolling_std("volume", self._volume_window, ddof=0)[index])
+        volume_mean = float(market.rolling_mean("volume", self._volume_window)[index])
+        volume_z = (market.volume_at(index) - volume_mean) / volume_std if volume_std > 0 else 0.0
+        if not np.isfinite(volume_z):
             volume_z = 0.0
 
         if not self._finite(prev_range_high, prev_range_low, current_atr, trend_now):
             return self._hold(timestamp, "indicator_not_ready", {})
 
+        z_now = self._rolling_zscore_at(market, index)
         position_side = self._position_side(portfolio)
         metadata = {
             "open": current_open,
@@ -108,11 +87,8 @@ class LiquiditySweepReversalStrategy:
             "volume_z": volume_z,
             "trend_ema": trend_now,
             "trend_distance_atr": trend_distance_atr,
+            "close_zscore": z_now,
         }
-
-        z = self._rolling_zscore(close, self._sweep_window)
-        z_now = float(z.iloc[-1]) if pd.notna(z.iloc[-1]) else 0.0
-        metadata["close_zscore"] = z_now
 
         if position_side == "LONG":
             if z_now >= -self._exit_zscore or self._bars_since_entry(portfolio) >= self._max_holding_bars:
@@ -126,12 +102,10 @@ class LiquiditySweepReversalStrategy:
 
         regime_ok = trend_distance_atr <= self._max_trend_distance_atr
         volume_ok = volume_z >= self._min_volume_z
-
         swept_high = current_high > prev_range_high
         rejected_high = current_close < prev_range_high
         high_reclaim_depth = (current_high - current_close) / max(current_high - prev_range_high, 1e-12)
         upper_wick_ok = upper_wick / current_atr >= self._min_wick_atr if current_atr > 0 else False
-
         swept_low = current_low < prev_range_low
         rejected_low = current_close > prev_range_low
         low_reclaim_depth = (current_close - current_low) / max(prev_range_low - current_low, 1e-12)
@@ -149,31 +123,22 @@ class LiquiditySweepReversalStrategy:
 
         return self._hold(timestamp, "no_liquidity_sweep", metadata)
 
-    @staticmethod
-    def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
-        prev_close = close.shift(1)
-        true_range = pd.concat(
-            [
-                high - low,
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        return true_range.ewm(alpha=1.0 / window, adjust=False).mean()
+    def generate_signal(self, market_window: pd.DataFrame, portfolio: Any) -> Signal:
+        market = MarketDataView.from_frame(market_window)
+        return self.generate_signal_at(market=market, index=len(market) - 1, portfolio=portfolio)
 
-    @staticmethod
-    def _rolling_zscore(close: pd.Series, window: int) -> pd.Series:
-        mean = close.rolling(window).mean()
-        std = close.rolling(window).std(ddof=0)
-        return (close - mean) / std.replace(0.0, pd.NA)
+    def _rolling_zscore_at(self, market: MarketDataView, index: int) -> float:
+        mean = market.rolling_mean("close", self._sweep_window)[index]
+        std = market.rolling_std("close", self._sweep_window, ddof=0)[index]
+        if not np.isfinite(mean) or not np.isfinite(std) or std <= 0:
+            return 0.0
+        return float((market.close_at(index) - mean) / std)
 
     @staticmethod
     def _position_side(portfolio: Any) -> str | None:
         side = getattr(portfolio, "position_side", None)
         if side in {"LONG", "SHORT"}:
             return str(side)
-
         quantity = float(getattr(portfolio, "position_quantity", 0.0) or 0.0)
         if quantity > 0:
             return "LONG"
@@ -190,14 +155,8 @@ class LiquiditySweepReversalStrategy:
             return 0
 
     @staticmethod
-    def _timestamp(market_window: pd.DataFrame) -> pd.Timestamp:
-        if market_window.empty:
-            return pd.Timestamp.utcnow()
-        return pd.Timestamp(market_window.iloc[-1]["timestamp"])
-
-    @staticmethod
     def _finite(*values: float) -> bool:
-        return all(pd.notna(value) for value in values)
+        return all(np.isfinite(float(value)) for value in values)
 
     def _hold(self, timestamp: pd.Timestamp, reason: str, metadata: dict[str, Any]) -> Signal:
         return Signal(timestamp, self._symbol, SignalType.HOLD, 0.0, reason, metadata)

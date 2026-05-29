@@ -15,6 +15,7 @@ from backend.execution.simulator import ExecutionSimulator
 from backend.portfolio.portfolio import Portfolio
 from backend.risk.position_sizer import PositionSizer
 from backend.strategy.base import BaseStrategy
+from backend.strategy.market_view import MarketDataView, call_strategy_signal
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class BacktestEngine:
         self._strategy = strategy
         self._strategy_name = strategy.__class__.__name__
         self._data = data.reset_index(drop=True)
+        self._market = MarketDataView.from_frame(self._data)
 
         self._portfolio = Portfolio(
             symbol=config.data.symbol,
@@ -61,11 +63,7 @@ class BacktestEngine:
                 close_price=float(current_bar["close"]),
             )
 
-            market_window = self._data.iloc[: index + 1]
-            signal = self._strategy.generate_signal(
-                market_window=market_window,
-                portfolio=self._portfolio,
-            )
+            signal = call_strategy_signal(self._strategy, self._market, index, self._portfolio)
 
             if signal.is_actionable and index + 1 < len(self._data):
                 order = self._position_sizer.size_order(

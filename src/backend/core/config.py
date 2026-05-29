@@ -7,7 +7,7 @@ from typing import Any
 import yaml
 
 from backend.core.exceptions import ConfigurationError
-from backend.core.paths import resolve_project_path
+from backend.core.paths import resolve_config_path, resolve_model_artifact_path, resolve_project_path
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,7 @@ class StrategyConfig:
     exit_z_score: float
     stop_z_score: float
     min_bars_required: int
+    parameters: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -106,7 +107,7 @@ def _require(mapping: dict[str, Any], key: str) -> Any:
 def _optional_path(value: Any) -> Path | None:
     if value is None:
         return None
-    return resolve_project_path(str(value))
+    return resolve_model_artifact_path(str(value))
 
 
 def _validate_ratios(train_ratio: float, validation_ratio: float) -> None:
@@ -121,7 +122,7 @@ def _validate_ratios(train_ratio: float, validation_ratio: float) -> None:
 
 
 def load_config(config_path: str | Path) -> AppConfig:
-    resolved_path = resolve_project_path(config_path)
+    resolved_path = resolve_config_path(config_path)
 
     if not resolved_path.exists():
         raise ConfigurationError(f"Config file not found: {resolved_path}")
@@ -172,6 +173,7 @@ def load_config(config_path: str | Path) -> AppConfig:
             exit_z_score=float(_require(strategy, "exit_z_score")),
             stop_z_score=float(_require(strategy, "stop_z_score")),
             min_bars_required=int(_require(strategy, "min_bars_required")),
+            parameters=dict(strategy.get("parameters", {})),
         ),
         ml=MLConfig(
             horizon_bars=int(_require(ml, "horizon_bars")),

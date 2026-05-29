@@ -2,25 +2,34 @@ FROM node:20-alpine AS deps
 
 WORKDIR /app
 
-RUN npm config set registry https://mirror-npm.runflare.com
-RUN npm config set strict-ssl false
+RUN npm config set registry ${NPM_REGISTRY} --global \
+    && npm config set strict-ssl false --global \
+    && npm config set fund false --global \
+    && npm config set audit false --global
 
 COPY package.json ./
 
-RUN if [ -f package-lock.json ]; then npm ci; else npm install --loglevel verbose; fi
+RUN if [ -f package-lock.json ]; then \
+      npm ci --include=dev --loglevel verbose; \
+    else \
+      npm install --include=dev --loglevel verbose; \
+    fi
 
 FROM node:20-alpine AS build
 
-ARG VITE_API_BASE_URL=http://localhost:8000
+ARG VITE_API_BASE_URL=/api
+ARG VITE_WS_BASE_URL=/ws
+ARG VITE_REQUEST_TIMEOUT_MS=30000
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+ENV VITE_WS_BASE_URL=${VITE_WS_BASE_URL}
+ENV VITE_REQUEST_TIMEOUT_MS=${VITE_REQUEST_TIMEOUT_MS}
 
 WORKDIR /app
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-RUN npm run build
-
+RUN ./node_modules/.bin/tsc -b && ./node_modules/.bin/vite build
 
 FROM nginx:1.27-alpine AS runtime
 
@@ -56,6 +65,9 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 75s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
     }
 
     location /ws/ {
@@ -64,8 +76,17 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+    }
+
+    location ~* \.(?:js|css|png|jpg|jpeg|gif|svg|ico|woff2?)$ {
+        try_files $uri =404;
+        expires 7d;
+        add_header Cache-Control "public, max-age=604800, immutable";
     }
 }
 EOF

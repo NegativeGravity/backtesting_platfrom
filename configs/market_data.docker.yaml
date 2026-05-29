@@ -26,3 +26,23 @@ redis:
   db: 0
   ttl_seconds: 604800
   key_prefix: market:klines:v1
+
+splits_recommended:
+  train_start: "2020-01-01T00:00:00Z"
+  train_end: "2024-01-01T00:00:00Z"
+  validation_start: "2024-01-01T00:00:00Z"
+  validation_end: "2025-01-01T00:00:00Z"
+  test_start: "2025-01-01T00:00:00Z"
+  test_end: "2026-01-01T00:00:00Z"
+
+splits_user_requested_no_overlap:
+  train_start: "2020-01-01T00:00:00Z"
+  train_end: "2025-01-01T00:00:00Z"
+  test_start: "2025-01-01T00:00:00Z"
+  test_end: "2026-01-01T00:00:00Z"
+
+splits_user_requested_with_leakage_warning:
+  train_start: "2020-01-01T00:00:00Z"
+  train_end: "2025-01-01T00:00:00Z"
+  test_start: "2024-01-01T00:00:00Z"
+  test_end: "2026-01-01T00:00:00Z"

@@ -1,7 +1,11 @@
+export type MarkerMode = 'auto' | 'all' | 'off';
+
 interface ChartToolbarProps {
   title: string;
-  markersVisible: boolean;
+  subtitle?: string;
+  markerMode: MarkerMode;
   equityVisible: boolean;
+  drawdownVisible?: boolean;
   isReplaying?: boolean;
   replayProgress?: number;
   replaySpeed?: number;
@@ -9,8 +13,9 @@ interface ChartToolbarProps {
   onZoomIn: () => void;
   onZoomOut: () => void;
   onGoToLatest: () => void;
-  onToggleMarkers: () => void;
+  onMarkerModeChange: (mode: MarkerMode) => void;
   onToggleEquity: () => void;
+  onToggleDrawdown?: () => void;
   onScreenshot: () => void;
   onReplayPlayPause?: () => void;
   onReplayReset?: () => void;
@@ -20,8 +25,10 @@ interface ChartToolbarProps {
 
 export function ChartToolbar({
   title,
-  markersVisible,
+  subtitle,
+  markerMode,
   equityVisible,
+  drawdownVisible = false,
   isReplaying = false,
   replayProgress = 100,
   replaySpeed = 6,
@@ -29,8 +36,9 @@ export function ChartToolbar({
   onZoomIn,
   onZoomOut,
   onGoToLatest,
-  onToggleMarkers,
+  onMarkerModeChange,
   onToggleEquity,
+  onToggleDrawdown,
   onScreenshot,
   onReplayPlayPause,
   onReplayReset,
@@ -40,63 +48,48 @@ export function ChartToolbar({
   return (
     <div className="chart-toolbar">
       <div>
-        <div className="section-kicker">TradingView-style Replay</div>
+        <span className="kicker">TradingView-style workspace</span>
         <h2>{title}</h2>
+        {subtitle && <p>{subtitle}</p>}
       </div>
 
-      <div className="chart-toolbar-actions">
-        <button type="button" onClick={onReplayPlayPause} className="toolbar-button replay-button">
-          {isReplaying ? "Pause" : "Play"}
-        </button>
-        <button type="button" onClick={onReplayStep} className="toolbar-button">
-          Step
-        </button>
-        <button type="button" onClick={onReplayReset} className="toolbar-button">
-          Reset
-        </button>
+      <div className="toolbar-actions" aria-label="Chart controls">
+        {onReplayPlayPause && (
+          <button type="button" onClick={onReplayPlayPause} className="toolbar-primary">
+            {isReplaying ? 'Pause' : 'Play'}
+          </button>
+        )}
+        {onReplayStep && <button type="button" onClick={onReplayStep}>Step</button>}
+        {onReplayReset && <button type="button" onClick={onReplayReset}>Reset</button>}
+        {onReplaySpeedChange && (
+          <label className="speed-control">
+            <span>{replaySpeed}x</span>
+            <input
+              aria-label="Replay speed"
+              type="range"
+              min="1"
+              max="50"
+              value={replaySpeed}
+              onChange={(event) => onReplaySpeedChange(Number(event.target.value))}
+            />
+          </label>
+        )}
+        {onReplayPlayPause && <span className="progress-pill">{Math.round(replayProgress)}%</span>}
 
-        <label className="speed-control">
-          <span>{replaySpeed}x</span>
-          <input
-            type="range"
-            min="1"
-            max="20"
-            value={replaySpeed}
-            onChange={(event) => onReplaySpeedChange?.(Number(event.target.value))}
-          />
-        </label>
+        <button type="button" onClick={onFit}>Fit</button>
+        <button type="button" onClick={onZoomIn}>+</button>
+        <button type="button" onClick={onZoomOut}>−</button>
+        <button type="button" onClick={onGoToLatest}>Latest</button>
 
-        <span className="progress-pill">{Math.round(replayProgress)}%</span>
+        <select value={markerMode} onChange={(event) => onMarkerModeChange(event.target.value as MarkerMode)} aria-label="Marker mode">
+          <option value="auto">Trades Auto</option>
+          <option value="all">Trades All</option>
+          <option value="off">Trades Off</option>
+        </select>
 
-        <button type="button" onClick={onFit} className="toolbar-button">
-          Fit
-        </button>
-        <button type="button" onClick={onZoomIn} className="toolbar-button">
-          +
-        </button>
-        <button type="button" onClick={onZoomOut} className="toolbar-button">
-          -
-        </button>
-        <button type="button" onClick={onGoToLatest} className="toolbar-button">
-          Latest
-        </button>
-        <button
-          type="button"
-          onClick={onToggleMarkers}
-          className={markersVisible ? "toolbar-button active" : "toolbar-button"}
-        >
-          Trades
-        </button>
-        <button
-          type="button"
-          onClick={onToggleEquity}
-          className={equityVisible ? "toolbar-button active" : "toolbar-button"}
-        >
-          Equity
-        </button>
-        <button type="button" onClick={onScreenshot} className="toolbar-button">
-          PNG
-        </button>
+        <button type="button" className={equityVisible ? 'active' : ''} onClick={onToggleEquity}>Equity</button>
+        {onToggleDrawdown && <button type="button" className={drawdownVisible ? 'active' : ''} onClick={onToggleDrawdown}>Drawdown</button>}
+        <button type="button" onClick={onScreenshot}>PNG</button>
       </div>
     </div>
   );

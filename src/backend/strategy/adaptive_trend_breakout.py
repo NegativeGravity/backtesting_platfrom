@@ -2,30 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
+from backend.strategy.market_view import MarketDataView
 from backend.strategy.signals import Signal, SignalType
 
 
 class AdaptiveTrendBreakoutStrategy:
-    """
-    Adaptive trend-following breakout strategy.
-
-    Designed for candle-level backtests on one liquid asset.
-    It trades only when three independent conditions agree:
-    1. Trend regime: fast EMA vs slow EMA.
-    2. Breakout: close breaks the previous Donchian channel.
-    3. Volatility expansion: current ATR is above its own baseline.
-
-    Long:
-        close > previous upper channel AND fast EMA > slow EMA AND ATR expansion.
-    Short:
-        close < previous lower channel AND fast EMA < slow EMA AND ATR expansion.
-    Exit:
-        trend flips, price loses trailing EMA, or volatility collapses.
-
-    No lookahead: all channel levels used for entry are shifted by one bar.
-    """
 
     def __init__(
         self,
@@ -52,43 +36,37 @@ class AdaptiveTrendBreakoutStrategy:
             self._atr_window + self._atr_baseline_window,
             self._exit_ema,
         ) + 2
+        self.max_lookback = self._min_bars + 8
 
-    def generate_signal(self, market_window: pd.DataFrame, portfolio: Any) -> Signal:
-        timestamp = self._timestamp(market_window)
-
-        if len(market_window) < self._min_bars:
+    def generate_signal_at(self, market: MarketDataView, index: int, portfolio: Any) -> Signal:
+        timestamp = market.timestamp(index)
+        if index + 1 < self._min_bars:
             return self._hold(timestamp, "not_enough_history", {"required_bars": self._min_bars})
 
-        frame = market_window.tail(self._min_bars + 5).copy()
-        close = frame["close"].astype(float)
-        high = frame["high"].astype(float)
-        low = frame["low"].astype(float)
+        current_close = market.close_at(index)
+        fast_now = float(market.ema("close", self._fast_ema)[index])
+        slow_now = float(market.ema("close", self._slow_ema)[index])
+        exit_ema_now = float(market.ema("close", self._exit_ema)[index])
+        prev_upper = float(market.rolling_max("high", self._channel_window, shift=1)[index])
+        prev_lower = float(market.rolling_min("low", self._channel_window, shift=1)[index])
+        atr = market.atr(self._atr_window)
+        current_atr = float(atr[index])
 
-        current_close = float(close.iloc[-1])
-        fast = close.ewm(span=self._fast_ema, adjust=False).mean()
-        slow = close.ewm(span=self._slow_ema, adjust=False).mean()
-        exit_ema = close.ewm(span=self._exit_ema, adjust=False).mean()
+        # The original used a rolling mean of ATR as baseline. Cache it once per data set.
+        baseline_key = f"atr_mean:{self._atr_window}:{self._atr_baseline_window}"
+        if baseline_key not in market._cache:
+            market._cache[baseline_key] = pd.Series(atr).rolling(self._atr_baseline_window).mean().to_numpy(dtype=np.float64)
+        atr_baseline = float(market._cache[baseline_key][index])
 
-        prev_upper = float(high.rolling(self._channel_window).max().shift(1).iloc[-1])
-        prev_lower = float(low.rolling(self._channel_window).min().shift(1).iloc[-1])
-
-        atr = self._atr(high=high, low=low, close=close, window=self._atr_window)
-        current_atr = float(atr.iloc[-1])
-        atr_baseline = float(atr.rolling(self._atr_baseline_window).mean().iloc[-1])
-
-        if not self._finite(prev_upper, prev_lower, current_atr, atr_baseline):
+        if not self._finite(prev_upper, prev_lower, current_atr, atr_baseline, fast_now, slow_now, exit_ema_now):
             return self._hold(timestamp, "indicator_not_ready", {})
 
         atr_expansion = current_atr / atr_baseline if atr_baseline > 0 else 0.0
-        fast_now = float(fast.iloc[-1])
-        slow_now = float(slow.iloc[-1])
-        exit_ema_now = float(exit_ema.iloc[-1])
-
         trend_up = fast_now > slow_now
         trend_down = fast_now < slow_now
         volatility_ok = atr_expansion >= self._min_atr_expansion
-
         position_side = self._position_side(portfolio)
+
         metadata = {
             "close": current_close,
             "fast_ema": fast_now,
@@ -124,25 +102,15 @@ class AdaptiveTrendBreakoutStrategy:
 
         return self._hold(timestamp, "no_breakout_alignment", metadata)
 
-    @staticmethod
-    def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
-        prev_close = close.shift(1)
-        true_range = pd.concat(
-            [
-                high - low,
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        return true_range.ewm(alpha=1.0 / window, adjust=False).mean()
+    def generate_signal(self, market_window: pd.DataFrame, portfolio: Any) -> Signal:
+        market = MarketDataView.from_frame(market_window)
+        return self.generate_signal_at(market=market, index=len(market) - 1, portfolio=portfolio)
 
     @staticmethod
     def _position_side(portfolio: Any) -> str | None:
         side = getattr(portfolio, "position_side", None)
         if side in {"LONG", "SHORT"}:
             return str(side)
-
         quantity = float(getattr(portfolio, "position_quantity", 0.0) or 0.0)
         if quantity > 0:
             return "LONG"
@@ -151,14 +119,8 @@ class AdaptiveTrendBreakoutStrategy:
         return None
 
     @staticmethod
-    def _timestamp(market_window: pd.DataFrame) -> pd.Timestamp:
-        if market_window.empty:
-            return pd.Timestamp.utcnow()
-        return pd.Timestamp(market_window.iloc[-1]["timestamp"])
-
-    @staticmethod
     def _finite(*values: float) -> bool:
-        return all(pd.notna(value) for value in values)
+        return all(np.isfinite(float(value)) for value in values)
 
     def _hold(self, timestamp: pd.Timestamp, reason: str, metadata: dict[str, Any]) -> Signal:
         return Signal(timestamp, self._symbol, SignalType.HOLD, 0.0, reason, metadata)

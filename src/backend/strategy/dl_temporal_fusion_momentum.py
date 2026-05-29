@@ -8,20 +8,12 @@ import numpy as np
 import pandas as pd
 
 from backend.strategy.base import BaseStrategy, PortfolioView
+from backend.strategy.market_view import MarketDataView
 from backend.strategy.signals import Signal, SignalType
 
 
 class DLTemporalFusionMomentumStrategy(BaseStrategy):
-    """TorchScript sequence-model strategy for causal OHLCV inference.
-
-    Expected artifact directory:
-        model.pt           TorchScript model returning logits/probabilities for [down, flat, up]
-        metadata.json      optional: thresholds, sequence_length, feature_columns, normalization
-
-    This class intentionally does not train a model. It performs deterministic,
-    low-latency inference from a pre-trained sequence model and converts calibrated
-    probabilities into LONG/SHORT/EXIT signals.
-    """
+    """TorchScript sequence-model strategy with cached sequence feature matrix."""
 
     def __init__(
         self,
@@ -61,15 +53,20 @@ class DLTemporalFusionMomentumStrategy(BaseStrategy):
         self._feature_mean = np.array(metadata.get("feature_mean", [0.0] * len(self._feature_columns)), dtype=np.float32)
         self._feature_std = np.array(metadata.get("feature_std", [1.0] * len(self._feature_columns)), dtype=np.float32)
         self._feature_std = np.where(self._feature_std == 0.0, 1.0, self._feature_std)
-
         self._model = torch.jit.load(str(self._model_path), map_location="cpu")
         self._model.eval()
+        self.max_lookback = self._sequence_length + 80
 
-    def generate_signal(self, market_window: pd.DataFrame, portfolio: PortfolioView) -> Signal:
-        timestamp = pd.Timestamp(market_window["timestamp"].iloc[-1])
-        sequence = self._build_sequence(market_window)
+    def generate_signal_at(self, market: MarketDataView, index: int, portfolio: PortfolioView) -> Signal:
+        timestamp = market.timestamp(index)
         metadata: dict[str, Any] = {"strategy": "dl_temporal_fusion_momentum"}
-
+        sequence = market.dl_sequence_at(
+            index,
+            feature_columns=self._feature_columns,
+            sequence_length=self._sequence_length,
+            feature_mean=self._feature_mean,
+            feature_std=self._feature_std,
+        )
         if sequence is None:
             return self._hold(timestamp, "dl_not_enough_sequence_history", metadata)
 
@@ -106,60 +103,15 @@ class DLTemporalFusionMomentumStrategy(BaseStrategy):
 
         return self._hold(timestamp, "dl_hold_position", metadata)
 
+    def generate_signal(self, market_window: pd.DataFrame, portfolio: PortfolioView) -> Signal:
+        market = MarketDataView.from_frame(market_window)
+        return self.generate_signal_at(market=market, index=len(market) - 1, portfolio=portfolio)
+
     def _load_metadata(self) -> dict[str, Any]:
         if not self._metadata_path.exists():
             return {}
         with self._metadata_path.open("r", encoding="utf-8") as file:
             return json.load(file)
-
-    def _build_sequence(self, market_window: pd.DataFrame) -> np.ndarray | None:
-        required = self._sequence_length + 64
-        if len(market_window) < required:
-            return None
-
-        df = market_window.copy()
-        close = df["close"].astype(float)
-        high = df["high"].astype(float)
-        low = df["low"].astype(float)
-        open_ = df["open"].astype(float)
-        volume = df["volume"].astype(float)
-        log_close = np.log(close)
-        log_return = log_close.diff()
-        atr = self._atr(high, low, close, 14)
-        ema_16 = close.ewm(span=16, adjust=False).mean()
-        ema_64 = close.ewm(span=64, adjust=False).mean()
-        volume_mean = volume.rolling(48).mean()
-        volume_std = volume.rolling(48).std().replace(0.0, np.nan)
-        channel_high = high.rolling(64).max().shift(1)
-        channel_low = low.rolling(64).min().shift(1)
-        channel_width = (channel_high - channel_low).replace(0.0, np.nan)
-
-        features = pd.DataFrame(index=df.index)
-        features["log_return_1"] = log_return
-        features["log_return_3"] = log_close.diff(3)
-        features["log_return_12"] = log_close.diff(12)
-        features["body_atr"] = (close - open_) / atr.replace(0.0, np.nan)
-        features["range_atr"] = (high - low) / atr.replace(0.0, np.nan)
-        features["upper_wick_atr"] = (high - np.maximum(open_, close)) / atr.replace(0.0, np.nan)
-        features["lower_wick_atr"] = (np.minimum(open_, close) - low) / atr.replace(0.0, np.nan)
-        features["ema_16_distance"] = close / ema_16 - 1.0
-        features["ema_64_distance"] = close / ema_64 - 1.0
-        features["ema_spread"] = ema_16 / ema_64 - 1.0
-        features["realized_vol_24"] = log_return.rolling(24).std()
-        features["realized_vol_64"] = log_return.rolling(64).std()
-        features["volume_z"] = (volume - volume_mean) / volume_std
-        features["channel_position"] = (close - channel_low) / channel_width
-        features["breakout_distance_atr"] = (close - channel_high) / atr.replace(0.0, np.nan)
-        features["breakdown_distance_atr"] = (channel_low - close) / atr.replace(0.0, np.nan)
-
-        for column in self._feature_columns:
-            if column not in features.columns:
-                features[column] = 0.0
-
-        sequence = features[self._feature_columns].tail(self._sequence_length)
-        sequence = sequence.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(dtype=np.float32)
-        sequence = (sequence - self._feature_mean) / self._feature_std
-        return sequence
 
     def _infer_probabilities(self, sequence: np.ndarray) -> np.ndarray:
         torch = self._torch
@@ -204,15 +156,6 @@ class DLTemporalFusionMomentumStrategy(BaseStrategy):
         shifted = values - np.max(values)
         exp_values = np.exp(shifted)
         return exp_values / np.sum(exp_values)
-
-    @staticmethod
-    def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
-        previous_close = close.shift(1)
-        true_range = pd.concat(
-            [(high - low), (high - previous_close).abs(), (low - previous_close).abs()],
-            axis=1,
-        ).max(axis=1)
-        return true_range.ewm(alpha=1.0 / window, adjust=False).mean()
 
     @staticmethod
     def _normalized_entropy(probabilities: np.ndarray) -> float:

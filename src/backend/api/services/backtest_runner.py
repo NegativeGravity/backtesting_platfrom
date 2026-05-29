@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import queue
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,7 @@ from backend.backtest.robot_engine import (
     RobotBacktestEngine,
 )
 from backend.core.config import load_config
-from backend.core.paths import resolve_project_path
+from backend.core.paths import resolve_model_artifact_path
 from backend.data.validator import validate_ohlcv
 from backend.strategy.factory import create_strategy
 from backend.data.market_store import MarketDataStore
@@ -27,6 +29,7 @@ def run_backtest_from_request(
     config_path: str,
     strategy_name: str,
     model_artifact_path: str | None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     robot_payload = {
         "robot_id": f"{strategy_name}_robot",
@@ -39,12 +42,13 @@ def run_backtest_from_request(
             }
         ],
     }
-    return run_robot_backtest_from_request(config_path=config_path, robot=robot_payload)
+    return run_robot_backtest_from_request(config_path=config_path, robot=robot_payload, cancel_event=cancel_event)
 
 
 def run_robot_backtest_from_request(
     config_path: str,
     robot: dict[str, Any],
+    cancel_event: threading.Event | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     result_queue: mp.Queue = mp.Queue(maxsize=1)
     process = mp.Process(
@@ -57,12 +61,20 @@ def run_robot_backtest_from_request(
         daemon=False,
     )
     process.start()
-    process.join()
+    while process.is_alive():
+        process.join(timeout=0.25)
+        if cancel_event is not None and cancel_event.is_set():
+            process.terminate()
+            process.join(timeout=3)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=3)
+            raise RuntimeError("Backtest job cancelled.")
 
-    if result_queue.empty():
-        raise RuntimeError(f"Backtest process exited without a result. exit_code={process.exitcode}")
-
-    payload = result_queue.get()
+    try:
+        payload = result_queue.get(timeout=5)
+    except queue.Empty as exc:
+        raise RuntimeError(f"Backtest process exited without a result. exit_code={process.exitcode}") from exc
     if not payload.get("ok"):
         raise RuntimeError(payload.get("error", "Backtest process failed."))
 
@@ -91,7 +103,7 @@ def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_qu
             strategy_name = str(raw_worker.get("strategy"))
             model_artifact_path = raw_worker.get("model_artifact_path")
             resolved_model_path = (
-                resolve_project_path(model_artifact_path)
+                resolve_model_artifact_path(model_artifact_path)
                 if model_artifact_path is not None and str(model_artifact_path).strip()
                 else None
             )

@@ -1,4 +1,4 @@
-import { Component, type ErrorInfo, type ReactNode } from "react";
+import { Component, type ErrorInfo, type ReactNode } from 'react';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -17,14 +17,14 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("UI panel crashed", error, info);
+    console.error('UI panel crashed', error, info);
   }
 
   render() {
     if (this.state.error) {
       return (
-        <section className="error-box">
-          <strong>{this.props.fallbackTitle ?? "Panel failed to render"}</strong>
+        <section className="notice error boundary">
+          <strong>{this.props.fallbackTitle ?? 'Panel failed to render'}</strong>
           <p>{this.state.error.message}</p>
           <button type="button" onClick={() => this.setState({ error: null })}>
             Try again

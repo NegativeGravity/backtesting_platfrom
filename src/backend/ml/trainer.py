@@ -72,9 +72,10 @@ def train_ml_momentum_model(
     model.fit(x_train_scaled, y_train)
 
     validation_probabilities = model.predict_proba(x_validation_scaled)[:, 1]
-    selected_threshold = _select_threshold(
+    selected_threshold = _select_ev_threshold(
         probabilities=validation_probabilities,
         labels=y_validation.to_numpy(),
+        net_returns=validation_features["net_future_return"].to_numpy(),
     )
 
 
@@ -104,6 +105,7 @@ def train_ml_momentum_model(
             "time_based_split",
             "scaler_fit_on_train_only",
             "threshold_selected_on_validation_only",
+            "threshold_selected_by_validation_expected_value_after_cost",
             "model_never_loaded_2025_data",
             "train_2020_2023_validation_2024",
             "2025_reserved_for_backtest_platform",        ],
@@ -134,6 +136,28 @@ def train_ml_momentum_model(
         split_info=split_info,
         feature_config=asdict(feature_config),
     )
+
+
+def _select_ev_threshold(probabilities: np.ndarray, labels: np.ndarray, net_returns: np.ndarray) -> float:
+    candidate_thresholds = np.linspace(0.50, 0.85, 36)
+    min_trades = max(10, int(len(probabilities) * 0.01))
+    best_threshold = _select_threshold(probabilities, labels)
+    best_score = -np.inf
+
+    for threshold in candidate_thresholds:
+        selected = probabilities >= threshold
+        trade_count = int(selected.sum())
+        if trade_count < min_trades:
+            continue
+        selected_returns = net_returns[selected]
+        if selected_returns.size == 0:
+            continue
+        score = float(np.nanmean(selected_returns)) * np.sqrt(trade_count)
+        if score > best_score:
+            best_score = score
+            best_threshold = float(threshold)
+
+    return best_threshold
 
 
 def _select_threshold(probabilities: np.ndarray, labels: np.ndarray) -> float:

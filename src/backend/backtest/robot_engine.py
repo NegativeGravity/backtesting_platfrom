@@ -22,6 +22,7 @@ from backend.engine.positions import (
 )
 from backend.execution.orders import OrderAction
 from backend.strategy.base import BaseStrategy
+from backend.strategy.market_view import MarketDataView, call_strategy_signal
 from backend.strategy.signals import Signal, SignalType
 from backend.utils.ids import new_id
 
@@ -69,6 +70,9 @@ class EquityPoint:
     open_position_count: int
     long_market_value: float
     short_market_value: float
+    reserved_margin: float
+    gross_unrealized_pnl: float
+    accounting_model: str
 
 
 @dataclass
@@ -117,10 +121,6 @@ class StrategyPortfolioView:
 
 class RobotBacktestEngine:
 
-    DEFAULT_CAPITAL_PER_TRADE_FRACTION = 0.10
-    DEFAULT_STOP_LOSS_PCT = 0.02
-    DEFAULT_TAKE_PROFIT_PCT = 0.04
-
     def __init__(
         self,
         config: AppConfig,
@@ -140,11 +140,13 @@ class RobotBacktestEngine:
 
         self._config = config
         self._data = data.reset_index(drop=True)
+        self._market = MarketDataView.from_frame(self._data)
         self._robot_spec = robot_spec
         self._event_callback = event_callback
-        self._capital_fraction = float(
-            capital_per_trade_fraction or self.DEFAULT_CAPITAL_PER_TRADE_FRACTION
-        )
+        configured_fraction = float(capital_per_trade_fraction or config.risk.max_position_notional_pct)
+        self._capital_fraction = min(max(configured_fraction, 0.0), 1.0)
+        self._stop_loss_pct = max(float(config.risk.stop_distance_pct), 0.0)
+        self._take_profit_pct = max(self._stop_loss_pct * 2.0, self._stop_loss_pct)
         self._report_writer = BacktestReportWriter(config.reporting.output_dir)
         self._runtime = RobotRuntime(
             robot_id=robot_spec.robot_id,
@@ -175,11 +177,10 @@ class RobotBacktestEngine:
             self._mark_positions(float(current_bar["close"]))
             self._record_equity(timestamp)
 
-            market_window = self._data.iloc[: index + 1]
             is_last_bar = index + 1 >= len(self._data)
 
             for worker in self._runtime.workers.values():
-                self._process_worker_signal(worker, market_window, current_bar, is_last_bar)
+                self._process_worker_signal(worker, index, current_bar, is_last_bar)
 
         self._force_close_open_positions(self._data.iloc[-1])
         self._record_equity(pd.Timestamp(self._data.iloc[-1]["timestamp"]))
@@ -237,6 +238,8 @@ class RobotBacktestEngine:
                 ],
             },
             "execution_model": "signal_on_bar_close_fill_on_next_bar_open",
+            "accounting_model": "collateral_based_free_cash_plus_reserved_margin_plus_gross_unrealized_pnl",
+            "slippage_model": "embedded_in_fill_price_not_subtracted_from_pnl",
             "position_model": "one_independent_position_per_strategy_worker_per_symbol",
             "metrics": metrics,
         }
@@ -258,7 +261,7 @@ class RobotBacktestEngine:
     def _process_worker_signal(
         self,
         worker: BacktestWorkerSpec,
-        market_window: pd.DataFrame,
+        bar_index: int,
         current_bar: pd.Series,
         is_last_bar: bool,
     ) -> None:
@@ -269,7 +272,7 @@ class RobotBacktestEngine:
             equity=self._calculate_equity(),
             cash=self._runtime.cash,
         )
-        signal = worker.strategy.generate_signal(market_window=market_window, portfolio=portfolio_view)
+        signal = call_strategy_signal(worker.strategy, self._market, bar_index, portfolio_view)
         self._record_signal(worker, signal)
 
         if not signal.is_actionable:
@@ -398,7 +401,7 @@ class RobotBacktestEngine:
                         self._record_order_status(timestamp, order, status="REJECTED", reason="quantity_below_minimum")
                         continue
                     fill_price, fee, slippage_cost = self._simulate_fill(order.action, open_price, quantity)
-                    required_cash = quantity * fill_price + fee + slippage_cost
+                    required_cash = self._entry_required_cash(quantity, fill_price, fee)
                     if required_cash > self._runtime.cash:
                         self._record_order_status(timestamp, order, status="REJECTED", reason="insufficient_cash")
                         continue
@@ -500,8 +503,13 @@ class RobotBacktestEngine:
 
     def _size_entry_quantity(self, price: float) -> float:
         equity = self._calculate_equity()
+        risk_amount = equity * self._config.risk.risk_per_trade_pct
+        stop_distance_pct = max(self._config.risk.stop_distance_pct, 1e-9)
+        stop_based_notional = risk_amount / stop_distance_pct
         risk_notional = equity * self._config.risk.max_position_notional_pct
-        target_notional = min(equity * self._capital_fraction, risk_notional, self._runtime.cash)
+        min_cash_reserve = equity * self._config.risk.min_cash_pct
+        deployable_cash = max(0.0, self._runtime.cash - min_cash_reserve)
+        target_notional = min(equity * self._capital_fraction, stop_based_notional, risk_notional, deployable_cash)
         if target_notional < self._config.risk.min_order_notional or price <= 0:
             return 0.0
         quantity = target_notional / price
@@ -521,6 +529,13 @@ class RobotBacktestEngine:
         slippage_cost = quantity * slippage_per_unit
         return fill_price, fee, slippage_cost
 
+    @staticmethod
+    def _entry_required_cash(quantity: float, fill_price: float, fee: float) -> float:
+        # Collateral-based model for both longs and shorts:
+        # reserve entry notional/margin and pay fees from free cash.
+        # Slippage is already in fill_price and must not be deducted again.
+        return quantity * fill_price + fee
+
     def _open_position(
         self,
         order: PendingOrder,
@@ -532,11 +547,11 @@ class RobotBacktestEngine:
         slippage_cost: float,
     ) -> None:
         if side == PositionSide.LONG:
-            stop_loss = fill_price * (1.0 - self.DEFAULT_STOP_LOSS_PCT)
-            take_profit = fill_price * (1.0 + self.DEFAULT_TAKE_PROFIT_PCT)
+            stop_loss = fill_price * (1.0 - self._stop_loss_pct)
+            take_profit = fill_price * (1.0 + self._take_profit_pct)
         else:
-            stop_loss = fill_price * (1.0 + self.DEFAULT_STOP_LOSS_PCT)
-            take_profit = fill_price * (1.0 - self.DEFAULT_TAKE_PROFIT_PCT)
+            stop_loss = fill_price * (1.0 + self._stop_loss_pct)
+            take_profit = fill_price * (1.0 - self._take_profit_pct)
 
         position = OpenPosition(
             position_id=new_id("pos"),
@@ -568,12 +583,10 @@ class RobotBacktestEngine:
         exit_reason: str,
     ) -> None:
         closed = build_closed_position(position, exit_time, exit_price, exit_fee, exit_slippage_cost, exit_reason)
-        if position.side == PositionSide.LONG:
-            self._runtime.cash += position.quantity * exit_price - exit_fee - exit_slippage_cost
-        else:
-            # Cash was reserved at entry. Release reserved collateral plus realized net PnL.
-            reserved = position.quantity * position.entry_price
-            self._runtime.cash += reserved + closed.net_pnl
+        # Release reserved entry margin and realize PnL. Entry fees were paid
+        # from free cash when the position was opened, and slippage is already
+        # embedded in entry/exit prices.
+        self._runtime.cash += position.notional + closed.gross_pnl - exit_fee
         self._runtime.closed_positions.append(closed)
         self._runtime.open_positions.pop(position_key(position.worker_id, position.symbol), None)
 
@@ -584,13 +597,25 @@ class RobotBacktestEngine:
         for position in self._runtime.open_positions.values():
             position.update_price(price)
 
+    def _calculate_reserved_margin(self) -> float:
+        return sum(position.notional for position in self._runtime.open_positions.values())
+
+    def _calculate_gross_unrealized_pnl(self) -> float:
+        return sum(position.gross_unrealized_pnl for position in self._runtime.open_positions.values())
+
     def _calculate_equity(self) -> float:
-        return self._runtime.cash + sum(position.current_notional + position.unrealized_pnl for position in self._runtime.open_positions.values())
+        return (
+            self._runtime.cash
+            + self._calculate_reserved_margin()
+            + self._calculate_gross_unrealized_pnl()
+        )
 
     def _record_equity(self, timestamp: pd.Timestamp) -> None:
         long_mv = sum(p.current_notional for p in self._runtime.open_positions.values() if p.side == PositionSide.LONG)
         short_mv = sum(p.current_notional for p in self._runtime.open_positions.values() if p.side == PositionSide.SHORT)
         position_mv = long_mv + short_mv
+        reserved_margin = self._calculate_reserved_margin()
+        gross_unrealized_pnl = self._calculate_gross_unrealized_pnl()
         equity = self._calculate_equity()
         self._runtime.peak_equity = max(self._runtime.peak_equity, equity)
         drawdown = equity / self._runtime.peak_equity - 1.0 if self._runtime.peak_equity > 0 else 0.0
@@ -606,6 +631,9 @@ class RobotBacktestEngine:
                 open_position_count=len(self._runtime.open_positions),
                 long_market_value=long_mv,
                 short_market_value=short_mv,
+                reserved_margin=reserved_margin,
+                gross_unrealized_pnl=gross_unrealized_pnl,
+                accounting_model="collateral_based",
             )
         )
 

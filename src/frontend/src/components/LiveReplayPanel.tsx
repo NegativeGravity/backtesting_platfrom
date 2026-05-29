@@ -1,15 +1,13 @@
-import { useMemo, useRef, useState } from "react";
-
-import {
-  createLiveReplaySocket,
-  runRobotBacktest,
-  startLiveReplay,
-  type LiveEvent,
-  type LiveRobotConfig,
-  type LiveStrategyWorkerConfig,
-} from "../api/liveApi";
-import type { StrategyName } from "../types";
-import { formatMoney, formatPercent } from "../utils/formatters";
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMutation } from '@tanstack/react-query';
+import { createLiveReplaySocket, runLiveRobotBacktest, startLiveReplay, waitForBacktestJob } from '../api/liveApi';
+import type { LiveEvent, LiveRobotConfig, LiveStrategyWorkerConfig, StrategyName } from '../types';
+import { formatMoney, formatPercent } from '../utils/formatters';
+import { LiveTradingChart } from './LiveTradingChart';
+import { LiveTradesTable } from './LiveTradesTable';
+import { StatusPill } from './StatusPill';
+import { VirtualEventStream } from './VirtualEventStream';
+import { WorkerDiagnosticsPanel } from './WorkerDiagnosticsPanel';
 
 interface LiveReplayPanelProps {
   modelArtifactPath: string;
@@ -17,73 +15,178 @@ interface LiveReplayPanelProps {
 }
 
 const STRATEGIES: Array<{ value: StrategyName; label: string; artifact: boolean }> = [
-  { value: "mean_reversion", label: "Mean Reversion", artifact: false },
-  { value: "adaptive_trend_breakout", label: "Adaptive Trend Breakout", artifact: false },
-  { value: "liquidity_sweep_reversal", label: "Liquidity Sweep Reversal", artifact: false },
-  { value: "ml_momentum", label: "ML Momentum", artifact: true },
-  { value: "ml_regime_meta_label", label: "ML Regime Meta Label", artifact: true },
-  { value: "dl_temporal_fusion_momentum", label: "DL Temporal Fusion Momentum", artifact: true },
+  { value: 'mean_reversion', label: 'Mean Reversion', artifact: false },
+  { value: 'adaptive_trend_breakout', label: 'Adaptive Trend Breakout', artifact: false },
+  { value: 'liquidity_sweep_reversal', label: 'Liquidity Sweep Reversal', artifact: false },
+  { value: 'ml_momentum', label: 'ML Momentum', artifact: true },
+  { value: 'ml_regime_meta_label', label: 'ML Regime Meta Label', artifact: true },
+  { value: 'dl_temporal_fusion_momentum', label: 'DL Temporal Fusion Momentum', artifact: true },
 ];
+
+type SocketStatus = 'idle' | 'connecting' | 'live' | 'paused' | 'closed' | 'error';
 
 export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPanelProps) {
   const socketRef = useRef<WebSocket | null>(null);
-  const pendingEventsRef = useRef<LiveEvent[]>([]);
-  const animationFrameRef = useRef<number | null>(null);
+  const pendingRef = useRef<LiveEvent[]>([]);
+  const frameRef = useRef<number | null>(null);
+  const manualCloseRef = useRef(false);
 
-  const [robotId, setRobotId] = useState("alpha_robot");
-  const [displayName, setDisplayName] = useState("Alpha Purple Robot");
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [websocketUrl, setWebsocketUrl] = useState<string | null>(null);
+  const [robotId, setRobotId] = useState('alpha_robot');
+  const [displayName, setDisplayName] = useState('Alpha Robot');
+  const [delay, setDelay] = useState(0.02);
   const [workers, setWorkers] = useState<LiveStrategyWorkerConfig[]>([
-    { worker_id: "trend_1", strategy: "adaptive_trend_breakout", model_artifact_path: null },
-    { worker_id: "sweep_1", strategy: "liquidity_sweep_reversal", model_artifact_path: null },
+    { worker_id: 'trend_1', strategy: 'adaptive_trend_breakout', model_artifact_path: null },
+    { worker_id: 'sweep_1', strategy: 'liquidity_sweep_reversal', model_artifact_path: null },
   ]);
   const [events, setEvents] = useState<LiveEvent[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
-  const [delay, setDelay] = useState(0.02);
+  const [status, setStatus] = useState<SocketStatus>('idle');
+  const [paused, setPaused] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const stats = useMemo(() => buildStats(events), [events]);
   const latestPortfolio = useMemo(
-    () => events.find((event) => event.event_type === "PORTFOLIO_UPDATED"),
+    () => events.find((event) => event.event_type === 'PORTFOLIO_UPDATED'),
     [events],
   );
 
-  const stats = useMemo(() => {
-    let fills = 0;
-    let signals = 0;
-    let opens = 0;
-    let closes = 0;
-
-    for (const event of events) {
-      if (event.event_type === "ORDER_FILLED") fills += 1;
-      if (event.event_type === "SIGNAL_GENERATED") signals += 1;
-      if (event.event_type === "POSITION_OPENED") opens += 1;
-      if (event.event_type === "POSITION_CLOSED") closes += 1;
-    }
-
-    return { fills, signals, opens, closes };
-  }, [events]);
-
   function flushEvents() {
-    animationFrameRef.current = null;
-    const pending = pendingEventsRef.current.splice(0);
+    frameRef.current = null;
+
+    if (paused) return;
+
+    const pending = pendingRef.current.splice(0);
     if (pending.length === 0) return;
 
-    setEvents((current) => [...pending.reverse(), ...current].slice(0, 2500));
+    setEvents((current) => [...pending.reverse(), ...current].slice(0, 6000));
   }
 
-  function enqueueEvent(event: LiveEvent) {
-    pendingEventsRef.current.push(event);
+  function enqueue(event: LiveEvent) {
+    pendingRef.current.push(event);
 
-    if (animationFrameRef.current === null) {
-      animationFrameRef.current = window.requestAnimationFrame(flushEvents);
+    if (pendingRef.current.length > 6000) {
+      pendingRef.current.splice(0, pendingRef.current.length - 6000);
+    }
+
+    if (frameRef.current === null && !paused) {
+      frameRef.current = window.requestAnimationFrame(flushEvents);
     }
   }
 
+  function connect(nextWebsocketUrl: string) {
+    manualCloseRef.current = false;
+    socketRef.current?.close();
+
+    setStatus('connecting');
+    setError(null);
+
+    const socket = createLiveReplaySocket(nextWebsocketUrl);
+    socketRef.current = socket;
+
+    socket.onopen = () => {
+      setStatus(paused ? 'paused' : 'live');
+    };
+
+    socket.onmessage = (message) => {
+      try {
+        const event = JSON.parse(message.data) as LiveEvent;
+        enqueue(event);
+
+        if (
+          event.event_type === 'LIVE_SESSION_COMPLETED' ||
+          event.event_type === 'LIVE_SESSION_ERROR' ||
+          event.event_type === 'LIVE_SESSION_STOPPED'
+        ) {
+          setStatus(event.event_type === 'LIVE_SESSION_ERROR' ? 'error' : 'closed');
+          void onCompleted();
+        }
+      } catch (parseError) {
+        console.error(parseError);
+      }
+    };
+
+    socket.onerror = () => {
+      setStatus('error');
+      setError(`WebSocket connection failed: ${nextWebsocketUrl}`);
+    };
+
+    socket.onclose = () => {
+      if (!manualCloseRef.current) {
+        setStatus((current) => (current === 'error' ? 'error' : 'closed'));
+      }
+    };
+  }
+
+  const startMutation = useMutation({
+    mutationFn: () => startLiveReplay({
+      config_path: 'configs/backtest.yaml',
+      robots: [buildRobot()],
+      replay_delay_seconds: delay,
+    }),
+    onMutate: () => {
+      setError(null);
+      setEvents([]);
+      pendingRef.current = [];
+      setStatus('connecting');
+    },
+    onSuccess: (response) => {
+      const nextWebsocketUrl = response.websocket_url ?? `/ws/live-replay/${response.session_id}`;
+
+      setSessionId(response.session_id);
+      setWebsocketUrl(nextWebsocketUrl);
+      connect(nextWebsocketUrl);
+    },
+    onError: (mutationError) => {
+      setStatus('error');
+      setError(mutationError instanceof Error ? mutationError.message : 'Failed to start live replay.');
+    },
+  });
+
+  const robotBacktestMutation = useMutation({
+    mutationFn: async () => {
+      const response = await runLiveRobotBacktest({
+        config_path: 'configs/backtest.yaml',
+        robot: buildRobot(),
+      });
+
+      return response.run_id || !response.job_id ? response : waitForBacktestJob(response.job_id);
+    },
+    onSuccess: async () => {
+      await onCompleted();
+    },
+    onError: (mutationError) => {
+      setError(mutationError instanceof Error ? mutationError.message : 'Failed to run robot backtest.');
+    },
+  });
+
+  useEffect(() => {
+    return () => {
+      manualCloseRef.current = true;
+      socketRef.current?.close();
+
+      if (frameRef.current !== null) {
+        window.cancelAnimationFrame(frameRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!paused && pendingRef.current.length > 0 && frameRef.current === null) {
+      frameRef.current = window.requestAnimationFrame(flushEvents);
+    }
+
+    setStatus((current) => {
+      if (paused && current === 'live') return 'paused';
+      if (!paused && current === 'paused') return 'live';
+      return current;
+    });
+  }, [paused]);
+
   function updateWorker(index: number, patch: Partial<LiveStrategyWorkerConfig>) {
-    setWorkers((current) =>
-      current.map((worker, workerIndex) =>
-        workerIndex === index ? { ...worker, ...patch } : worker,
-      ),
-    );
+    setWorkers((current) => current.map((worker, workerIndex) => (
+      workerIndex === index ? { ...worker, ...patch } : worker
+    )));
   }
 
   function addWorker() {
@@ -91,7 +194,7 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
       ...current,
       {
         worker_id: `worker_${current.length + 1}`,
-        strategy: "adaptive_trend_breakout",
+        strategy: 'adaptive_trend_breakout',
         model_artifact_path: null,
       },
     ]);
@@ -102,110 +205,67 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
   }
 
   function buildRobot(): LiveRobotConfig {
-    const strategyWorkers = workers.map((worker) => {
-      const requiresArtifact = STRATEGIES.some(
-        (item) => item.value === worker.strategy && item.artifact,
-      );
-
-      return {
-        ...worker,
-        model_artifact_path: requiresArtifact
-          ? worker.model_artifact_path || modelArtifactPath || null
-          : null,
-      };
-    });
-
     return {
-      robot_id: robotId.trim(),
-      display_name: displayName.trim(),
-      strategy_workers: strategyWorkers,
+      robot_id: robotId.trim() || 'alpha_robot',
+      display_name: displayName.trim() || 'Alpha Robot',
+      strategy_workers: workers.map((worker) => {
+        const requiresArtifact = STRATEGIES.some((strategy) => (
+          strategy.value === worker.strategy && strategy.artifact
+        ));
+
+        return {
+          ...worker,
+          worker_id: worker.worker_id?.trim() || null,
+          model_artifact_path: requiresArtifact
+            ? worker.model_artifact_path || modelArtifactPath || null
+            : null,
+        };
+      }),
     };
   }
 
-  async function handleStartLiveReplay() {
-    setError(null);
-    setEvents([]);
-    setIsRunning(true);
-
-    try {
-      socketRef.current?.close();
-
-      const response = await startLiveReplay({
-        config_path: "configs/backtest.yaml",
-        robots: [buildRobot()],
-        replay_delay_seconds: delay,
-      });
-
-      const socket = createLiveReplaySocket(response.session_id);
-      socketRef.current = socket;
-
-      socket.onmessage = (message) => {
-        const event = JSON.parse(message.data) as LiveEvent;
-        enqueueEvent(event);
-
-        if (
-          event.event_type === "LIVE_SESSION_COMPLETED" ||
-          event.event_type === "LIVE_SESSION_ERROR"
-        ) {
-          setIsRunning(false);
-          void onCompleted();
-        }
-      };
-
-      socket.onerror = () => {
-        setError("Live replay websocket failed.");
-        setIsRunning(false);
-      };
-
-      socket.onclose = () => {
-        setIsRunning(false);
-      };
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start live replay.");
-      setIsRunning(false);
-    }
-  }
-
-  async function handleRobotBacktest() {
-    setError(null);
-    setIsRunning(true);
-
-    try {
-      await runRobotBacktest({
-        config_path: "configs/backtest.yaml",
-        robot: buildRobot(),
-      });
-      await onCompleted();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to run robot backtest.");
-    } finally {
-      setIsRunning(false);
-    }
+  function stopSocket() {
+    manualCloseRef.current = true;
+    socketRef.current?.close();
+    setStatus('closed');
   }
 
   return (
-    <section className="live-grid">
-      <section className="glass-card">
-        <div className="panel-header">
+    <section className="live-layout">
+      <aside className="panel live-builder">
+        <div className="panel-head">
           <div>
-            <div className="section-kicker">Robot Builder</div>
-            <h2>Multi-Strategy Robot</h2>
-            <p>Define a robot with independent strategy workers.</p>
+            <span className="kicker">Robot builder</span>
+            <h2>Live Replay</h2>
+            <p>Multi-worker robot with websocket telemetry.</p>
           </div>
+
+          <StatusPill
+            status={status}
+            tone={
+              status === 'live'
+                ? 'live'
+                : status === 'error'
+                  ? 'bad'
+                  : status === 'paused'
+                    ? 'warn'
+                    : 'neutral'
+            }
+          />
         </div>
 
-        <label className="field">
-          <span>Robot ID</span>
+        <label>
+          Robot ID
           <input value={robotId} onChange={(event) => setRobotId(event.target.value)} />
         </label>
 
-        <label className="field">
-          <span>Display Name</span>
+        <label>
+          Display Name
           <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
         </label>
 
-        <label className="field">
-          <span>Replay Delay Seconds</span>
+        <label>
+          Replay Delay Seconds
           <input
             type="number"
             min="0"
@@ -215,31 +275,29 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
           />
         </label>
 
-        <div className="worker-list">
+        <div className="worker-stack">
           {workers.map((worker, index) => (
-            <div key={index} className="worker-card">
-              <div className="worker-card-header">
-                <strong>Worker {index + 1}</strong>
-                <button type="button" className="toolbar-button" onClick={() => removeWorker(index)}>
+            <article className="worker-card" key={`${worker.worker_id}-${index}`}>
+              <header>
+                <b>Worker {index + 1}</b>
+                <button type="button" onClick={() => removeWorker(index)}>
                   Remove
                 </button>
-              </div>
+              </header>
 
-              <label className="field">
-                <span>Worker ID</span>
+              <label>
+                Worker ID
                 <input
-                  value={worker.worker_id ?? ""}
+                  value={worker.worker_id ?? ''}
                   onChange={(event) => updateWorker(index, { worker_id: event.target.value })}
                 />
               </label>
 
-              <label className="field">
-                <span>Strategy</span>
+              <label>
+                Strategy
                 <select
                   value={worker.strategy}
-                  onChange={(event) =>
-                    updateWorker(index, { strategy: event.target.value as StrategyName })
-                  }
+                  onChange={(event) => updateWorker(index, { strategy: event.target.value as StrategyName })}
                 >
                   {STRATEGIES.map((strategy) => (
                     <option key={strategy.value} value={strategy.value}>
@@ -249,90 +307,150 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
                 </select>
               </label>
 
-              <label className="field">
-                <span>Artifact Path</span>
+              <label>
+                Artifact
                 <input
-                  value={worker.model_artifact_path ?? ""}
-                  placeholder="Only for ML/DL workers"
-                  onChange={(event) =>
-                    updateWorker(index, { model_artifact_path: event.target.value || null })
-                  }
+                  value={worker.model_artifact_path ?? ''}
+                  placeholder="Only for ML/DL"
+                  onChange={(event) => updateWorker(index, {
+                    model_artifact_path: event.target.value || null,
+                  })}
                 />
               </label>
-            </div>
+            </article>
           ))}
         </div>
 
-        <button type="button" className="toolbar-button" onClick={addWorker}>
+        <button type="button" onClick={addWorker}>
           Add Worker
         </button>
 
         <div className="action-row">
-          <button type="button" className="primary-action" onClick={handleStartLiveReplay} disabled={isRunning}>
-            <span>{isRunning ? "Running..." : "Start Live Replay"}</span>
-            <strong>▶</strong>
+          <button
+            type="button"
+            className="primary"
+            disabled={startMutation.isPending}
+            onClick={() => startMutation.mutate()}
+          >
+            {startMutation.isPending ? 'Starting…' : 'Start Live'}
           </button>
-          <button type="button" className="primary-action secondary" onClick={handleRobotBacktest} disabled={isRunning}>
-            <span>Run Robot Backtest</span>
-            <strong>↗</strong>
+
+          <button type="button" onClick={() => setPaused((value) => !value)}>
+            {paused ? 'Resume UI' : 'Pause UI'}
+          </button>
+
+          <button type="button" onClick={stopSocket}>
+            Stop
+          </button>
+
+          {websocketUrl && (
+            <button type="button" onClick={() => connect(websocketUrl)}>
+              Reconnect
+            </button>
+          )}
+
+          <button
+            type="button"
+            className="secondary"
+            disabled={robotBacktestMutation.isPending}
+            onClick={() => robotBacktestMutation.mutate()}
+          >
+            {robotBacktestMutation.isPending ? 'Running…' : 'Robot Backtest'}
           </button>
         </div>
 
-        {error && <div className="error-box">{error}</div>}
-      </section>
-
-      <section className="glass-card">
-        <div className="panel-header">
-          <div>
-            <div className="section-kicker">Live Telemetry</div>
-            <h2>Event Stream</h2>
-            <p>Realtime robot, order, signal and portfolio events.</p>
+        {sessionId && (
+          <div className="selected-artifact">
+            <span>Live session</span>
+            <b>{sessionId}</b>
           </div>
-        </div>
+        )}
 
+        {websocketUrl && (
+          <div className="selected-artifact">
+            <span>WebSocket URL</span>
+            <b>{websocketUrl}</b>
+          </div>
+        )}
+
+        {error && (
+          <div className="notice error">
+            <strong>Live replay error</strong>
+            <p>{error}</p>
+          </div>
+        )}
+      </aside>
+
+      <section className="live-main">
         <section className="summary-grid live-summary-grid">
-          <article className="summary-card">
+          <article className="metric-card">
             <span>Signals</span>
             <strong>{stats.signals}</strong>
+            <small>Generated strategy signals</small>
           </article>
-          <article className="summary-card">
+
+          <article className="metric-card">
             <span>Fills</span>
             <strong>{stats.fills}</strong>
+            <small>Filled orders</small>
           </article>
-          <article className="summary-card">
+
+          <article className="metric-card">
             <span>Opened</span>
             <strong>{stats.opens}</strong>
+            <small>Position opened events</small>
           </article>
-          <article className="summary-card">
+
+          <article className="metric-card">
             <span>Closed</span>
             <strong>{stats.closes}</strong>
+            <small>Position closed events</small>
           </article>
-          <article className="summary-card">
+
+          <article className="metric-card">
             <span>Equity</span>
-            <strong>{formatMoney(latestPortfolio?.payload?.equity)}</strong>
+            <strong>{formatMoney(latestPortfolio?.payload.equity)}</strong>
+            <small>Latest portfolio update</small>
           </article>
-          <article className="summary-card">
+
+          <article className="metric-card">
             <span>Return</span>
-            <strong>{formatPercent(latestPortfolio?.payload?.total_return)}</strong>
+            <strong>{formatPercent(latestPortfolio?.payload.total_return)}</strong>
+            <small>Latest total return</small>
           </article>
         </section>
 
-        <div className="event-stream">
-          {events.length === 0 ? (
-            <div className="empty-state">No events yet.</div>
-          ) : (
-            events.slice(0, 160).map((event, index) => (
-              <article key={`${event.event_id ?? index}-${event.timestamp}`} className="event-card">
-                <div>
-                  <strong>{event.event_type}</strong>
-                  <span>{event.source}</span>
-                </div>
-                <small>{event.timestamp ?? ""}</small>
-              </article>
-            ))
-          )}
-        </div>
+        <LiveTradingChart events={events} />
+        <LiveTradesTable events={events} />
+        <WorkerDiagnosticsPanel events={events} />
+
+        <section className="panel">
+          <div className="panel-head">
+            <div>
+              <span className="kicker">Telemetry</span>
+              <h2>Virtualized Event Stream</h2>
+            </div>
+
+            <span className="badge">{events.length} events</span>
+          </div>
+
+          <VirtualEventStream events={events} />
+        </section>
       </section>
     </section>
   );
+}
+
+function buildStats(events: LiveEvent[]) {
+  return events.reduce((stats, event) => ({
+    signals: stats.signals + (event.event_type === 'SIGNAL_GENERATED' ? 1 : 0),
+    fills: stats.fills + (event.event_type === 'ORDER_FILLED' ? 1 : 0),
+    opens: stats.opens + (event.event_type === 'POSITION_OPENED' ? 1 : 0),
+    closes: stats.closes + (event.event_type === 'POSITION_CLOSED' ? 1 : 0),
+  }), {
+    signals: 0,
+    fills: 0,
+    opens: 0,
+    closes: 0,
+  });
 }

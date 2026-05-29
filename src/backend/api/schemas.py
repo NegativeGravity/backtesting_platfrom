@@ -26,9 +26,21 @@ class BacktestRunRequest(BaseModel):
 
 
 class BacktestRunResponse(BaseModel):
-    run_id: str
-    run_dir: str
-    summary: dict[str, Any]
+    run_id: str | None = None
+    run_dir: str | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    job_id: str | None = None
+    status: Literal["queued", "running", "completed", "failed", "cancelled"] | None = None
+    error: str | None = None
+
+
+class BacktestJobResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "completed", "failed", "cancelled"]
+    run_id: str | None = None
+    run_dir: str | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
 
 
 class BacktestRunListItem(BaseModel):
@@ -85,9 +97,14 @@ class ReportResponse(BaseModel):
     run_id: str
     summary: dict[str, Any] = Field(default_factory=dict)
     trades: list[dict[str, Any]] = Field(default_factory=list)
+    closed_positions: list[dict[str, Any]] = Field(default_factory=list)
     equity_curve: list[dict[str, Any]] = Field(default_factory=list)
     benchmark_curve: list[dict[str, Any]] = Field(default_factory=list)
     execution_log: list[dict[str, Any]] = Field(default_factory=list)
+    orders: list[dict[str, Any]] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    model: dict[str, Any] = Field(default_factory=dict)
 
 
 class LiveReplayResponse(BaseModel):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 from pandas.errors import EmptyDataError
@@ -40,6 +40,9 @@ class ReportRepository:
 
     def read_chart_data(self, run_id: str) -> dict[str, Any]:
         return self._read_chart_data_impl(run_id)
+
+    def export_path(self, run_id: str, export_format: Literal["csv", "parquet", "html"]) -> Path:
+        return self._export_path_impl(run_id, export_format)
 
     def _list_runs_impl(self) -> list[dict[str, Any]]:
         runs: list[dict[str, Any]] = []
@@ -112,6 +115,7 @@ class ReportRepository:
             run_dir / "benchmark_curve.csv",
             fallback_columns=["timestamp", "equity", "benchmark_equity"],
         )
+        config_snapshot = self._read_json(run_dir / "config_snapshot.json")
 
         return self._json_safe(
             {
@@ -120,14 +124,122 @@ class ReportRepository:
                 "trades": trades,
                 "closed_positions": closed_positions,
                 "execution_log": execution_log,
+                "orders": execution_log,
                 "equity_curve": equity_curve,
                 "benchmark_curve": benchmark_curve,
+                "config": config_snapshot,
+                "diagnostics": self._extract_diagnostics(summary),
+                "model": self._extract_model_metadata(summary),
             }
         )
 
     def _read_summary_impl(self, run_id: str) -> dict[str, Any]:
         run_dir = self._get_run_dir(run_id)
         return self._json_safe(self._read_json(run_dir / "summary.json"))
+
+    def _export_path_impl(self, run_id: str, export_format: Literal["csv", "parquet", "html"]) -> Path:
+        run_dir = self._get_run_dir(run_id)
+        if export_format == "csv":
+            csv_path = run_dir / "trades.csv"
+            if not csv_path.exists() or csv_path.stat().st_size == 0:
+                csv_path = run_dir / "closed_positions.csv"
+            if not csv_path.exists():
+                raise FileNotFoundError(f"No CSV export found for run: {run_id}")
+            return csv_path
+
+        if export_format == "parquet":
+            parquet_path = run_dir / "trades.parquet"
+            csv_path = self._export_path_impl(run_id, "csv")
+            needs_refresh = (
+                not parquet_path.exists()
+                or parquet_path.stat().st_mtime < csv_path.stat().st_mtime
+            )
+            if needs_refresh:
+                frame = self._safe_read_csv(csv_path, fallback_columns=self._trade_columns())
+                frame.to_parquet(parquet_path, index=False)
+            return parquet_path
+
+        if export_format == "html":
+            html_path = run_dir / "report.html"
+            summary_path = run_dir / "summary.json"
+            trades_path = self._export_path_impl(run_id, "csv")
+            needs_refresh = (
+                not html_path.exists()
+                or html_path.stat().st_mtime < summary_path.stat().st_mtime
+                or html_path.stat().st_mtime < trades_path.stat().st_mtime
+            )
+            if needs_refresh:
+                html_path.write_text(self._render_html_report(run_id), encoding="utf-8")
+            return html_path
+
+        raise ValueError(f"Unsupported export format: {export_format}")
+
+    def _render_html_report(self, run_id: str) -> str:
+        run_dir = self._get_run_dir(run_id)
+        summary = self._read_json(run_dir / "summary.json")
+        trades = self._safe_read_csv(self._export_path_impl(run_id, "csv"), fallback_columns=self._trade_columns())
+        metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+        metrics_rows = "".join(
+            f"<tr><th>{self._escape_html(str(key))}</th><td>{self._escape_html(str(value))}</td></tr>"
+            for key, value in metrics.items()
+        )
+        trades_html = trades.to_html(index=False, escape=True) if not trades.empty else "<p>No trades.</p>"
+        return (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>{self._escape_html(run_id)} report</title>"
+            "<style>body{font-family:Inter,Arial,sans-serif;margin:32px;background:#0b1220;color:#e5eefc}"
+            "table{border-collapse:collapse;width:100%;margin:16px 0;background:#101827}"
+            "th,td{border:1px solid #243244;padding:8px;text-align:left;font-size:13px}"
+            "th{background:#172033}</style></head><body>"
+            f"<h1>{self._escape_html(run_id)}</h1>"
+            "<h2>Metrics</h2><table>" + metrics_rows + "</table>"
+            "<h2>Trades</h2>" + trades_html + "</body></html>"
+        )
+
+    @staticmethod
+    def _escape_html(value: str) -> str:
+        return (
+            value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    @staticmethod
+    def _extract_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
+        diagnostics = summary.get("diagnostics") or summary.get("worker_diagnostics")
+        return diagnostics if isinstance(diagnostics, dict) else {}
+
+    @staticmethod
+    def _extract_model_metadata(summary: dict[str, Any]) -> dict[str, Any]:
+        for key in ("model", "artifact"):
+            value = summary.get(key)
+            if isinstance(value, dict):
+                return value
+
+        robot = summary.get("robot")
+        if isinstance(robot, dict):
+            workers = robot.get("workers")
+            if isinstance(workers, list):
+                model_workers = [
+                    worker
+                    for worker in workers
+                    if isinstance(worker, dict) and worker.get("model_artifact_path")
+                ]
+                if model_workers:
+                    return {"workers": model_workers}
+
+        workers = summary.get("strategy_workers")
+        if isinstance(workers, list):
+            model_workers = [
+                worker
+                for worker in workers
+                if isinstance(worker, dict) and worker.get("model_artifact_path")
+            ]
+            if model_workers:
+                return {"workers": model_workers}
+
+        return {}
 
     def _read_chart_data_impl(self, run_id: str) -> dict[str, Any]:
         run_dir = self._get_run_dir(run_id)
