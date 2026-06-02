@@ -1,6 +1,5 @@
 <div align="center">
   <img src="assets/app-logo.png" width="160" />
-  <h1>Quant Research Terminal</h1>
   <p>
     A research-grade trading robot and backtesting platform for crypto and market assets, built with a clean Python backend, a modern React frontend, and multiple rule-based, machine-learning, deep-learning, and Helformer-assisted strategies.
   </p>
