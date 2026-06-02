@@ -11,7 +11,10 @@ export type StrategyName =
   | 'adaptive_trend_expansion_pro'
   | 'capitulation_reversal_pro'
   | 'volatility_squeeze_breakout'
-  | 'meta_labeled_alpha_allocator_pro';
+  | 'meta_labeled_alpha_allocator_pro'
+  | 'regime_adaptive_btc_trend_breakout'
+  | 'liquidation_shock_mean_reversion'
+  | 'meta_labeled_ensemble_alpha';
 
 export type BacktestJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
@@ -32,6 +35,7 @@ export interface BacktestRunRequest {
   config_path: string;
   model_artifact_path?: string | null;
   helformer_artifact_path?: string | null;
+  use_helformer_forecast?: boolean;
 }
 
 export interface BacktestRunResponse {
@@ -67,6 +71,7 @@ export interface LiveStrategyWorkerConfig {
   strategy: StrategyName;
   model_artifact_path?: string | null;
   helformer_artifact_path?: string | null;
+  use_helformer_forecast?: boolean;
 }
 
 export interface LiveRobotConfig {

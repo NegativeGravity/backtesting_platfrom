@@ -37,6 +37,7 @@ class BacktestWorkerSpec:
     strategy: BaseStrategy
     model_artifact_path: str | None = None
     helformer_artifact_path: str | None = None
+    use_helformer_forecast: bool = False
 
 
 @dataclass(frozen=True)
@@ -250,6 +251,7 @@ class RobotBacktestEngine:
                         "strategy": worker.strategy_name,
                         "model_artifact_path": worker.model_artifact_path,
                         "helformer_artifact_path": worker.helformer_artifact_path,
+                        "use_helformer_forecast": worker.use_helformer_forecast,
                     }
                     for worker in self._runtime.workers.values()
                 ],

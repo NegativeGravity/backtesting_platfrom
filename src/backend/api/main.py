@@ -33,7 +33,7 @@ from backend.api.services.report_repository import ReportRepository
 from backend.core.config import load_config
 from backend.core.logging import setup_logging
 from backend.engine.live_replay import LiveRobotSpec, LiveStrategyWorkerSpec
-from backend.strategy.factory import STRATEGIES_REQUIRING_ARTIFACT, STRATEGIES_USING_HELFORMER_FORECASTER, SUPPORTED_STRATEGIES
+from backend.strategy.factory import STRATEGIES_REQUIRING_ARTIFACT, STRATEGIES_SUPPORTING_HELFORMER_FORECASTER, SUPPORTED_STRATEGIES
 from backend.utils.ids import new_id
 
 from pathlib import Path
@@ -111,14 +111,13 @@ def list_datasets() -> list[DatasetInfo]:
     ]
 
 
-def _validate_strategy_artifacts(strategy: str, model_artifact_path: str | None, helformer_artifact_path: str | None) -> None:
+def _validate_strategy_artifacts(strategy: str, model_artifact_path: str | None, helformer_artifact_path: str | None, use_helformer_forecast: bool) -> None:
     if strategy in STRATEGIES_REQUIRING_ARTIFACT and not str(model_artifact_path or "").strip():
         raise HTTPException(status_code=400, detail=f"model_artifact_path is required for {strategy}.")
-    if strategy in STRATEGIES_USING_HELFORMER_FORECASTER and not str(helformer_artifact_path or "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail=f"helformer_artifact_path is required for {strategy}. All non-Helformer-native strategies must evaluate projected t+1 conditions through the Helformer next-close forecaster.",
-        )
+    if use_helformer_forecast and strategy not in STRATEGIES_SUPPORTING_HELFORMER_FORECASTER:
+        raise HTTPException(status_code=400, detail=f"Helformer forecast projection is not supported for {strategy}.")
+    if use_helformer_forecast and not str(helformer_artifact_path or "").strip():
+        raise HTTPException(status_code=400, detail=f"helformer_artifact_path is required when Helformer forecast is enabled for {strategy}.")
 
 
 @app.get("/strategies", response_model=list[StrategyInfo])
@@ -127,7 +126,8 @@ def list_strategies() -> list[StrategyInfo]:
         StrategyInfo(
             name=strategy_name,  # type: ignore[arg-type]
             requires_model_artifact=strategy_name in STRATEGIES_REQUIRING_ARTIFACT,
-            requires_helformer_forecaster=strategy_name in STRATEGIES_USING_HELFORMER_FORECASTER,
+            requires_helformer_forecaster=False,
+            supports_helformer_forecaster=strategy_name in STRATEGIES_SUPPORTING_HELFORMER_FORECASTER,
         )
         for strategy_name in sorted(SUPPORTED_STRATEGIES)
     ]
@@ -135,13 +135,14 @@ def list_strategies() -> list[StrategyInfo]:
 
 @app.post("/backtests/run", response_model=BacktestRunResponse)
 def run_backtest(request: BacktestRunRequest) -> BacktestRunResponse:
-    _validate_strategy_artifacts(request.strategy, request.model_artifact_path, request.helformer_artifact_path)
+    _validate_strategy_artifacts(request.strategy, request.model_artifact_path, request.helformer_artifact_path, request.use_helformer_forecast)
     job = job_manager.submit(
         lambda cancel_event: run_backtest_from_request(
             config_path=request.config_path,
             strategy_name=request.strategy,
             model_artifact_path=request.model_artifact_path,
             helformer_artifact_path=request.helformer_artifact_path,
+            use_helformer_forecast=request.use_helformer_forecast,
             cancel_event=cancel_event,
         )
     )
@@ -151,7 +152,7 @@ def run_backtest(request: BacktestRunRequest) -> BacktestRunResponse:
 @app.post("/robot-backtests/run", response_model=BacktestRunResponse)
 def run_robot_backtest(request: RobotBacktestRequest) -> BacktestRunResponse:
     for worker in request.robot.strategy_workers:
-        _validate_strategy_artifacts(worker.strategy, worker.model_artifact_path, worker.helformer_artifact_path)
+        _validate_strategy_artifacts(worker.strategy, worker.model_artifact_path, worker.helformer_artifact_path, worker.use_helformer_forecast)
     robot_payload = {
         "robot_id": request.robot.robot_id,
         "display_name": request.robot.display_name,
@@ -161,6 +162,7 @@ def run_robot_backtest(request: RobotBacktestRequest) -> BacktestRunResponse:
                 "strategy": worker.strategy,
                 "model_artifact_path": worker.model_artifact_path,
                 "helformer_artifact_path": worker.helformer_artifact_path,
+                "use_helformer_forecast": worker.use_helformer_forecast,
             }
             for worker in request.robot.strategy_workers
         ],
@@ -246,7 +248,7 @@ def start_live_replay(request: LiveReplayRequest) -> LiveReplayResponse:
     try:
         for robot in request.robots:
             for worker in robot.strategy_workers:
-                _validate_strategy_artifacts(worker.strategy, worker.model_artifact_path, worker.helformer_artifact_path)
+                _validate_strategy_artifacts(worker.strategy, worker.model_artifact_path, worker.helformer_artifact_path, worker.use_helformer_forecast)
 
         robot_specs = [
             LiveRobotSpec(
@@ -258,6 +260,7 @@ def start_live_replay(request: LiveReplayRequest) -> LiveReplayResponse:
                         strategy_name=worker.strategy,
                         model_artifact_path=worker.model_artifact_path,
                         helformer_artifact_path=worker.helformer_artifact_path,
+                        use_helformer_forecast=worker.use_helformer_forecast,
                     )
                     for worker in robot.strategy_workers
                 ],

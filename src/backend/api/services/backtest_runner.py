@@ -30,6 +30,7 @@ def run_backtest_from_request(
     strategy_name: str,
     model_artifact_path: str | None,
     helformer_artifact_path: str | None = None,
+    use_helformer_forecast: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     robot_payload = {
@@ -41,6 +42,7 @@ def run_backtest_from_request(
                 "strategy": strategy_name,
                 "model_artifact_path": model_artifact_path,
                 "helformer_artifact_path": helformer_artifact_path,
+                "use_helformer_forecast": use_helformer_forecast,
             }
         ],
     }
@@ -105,6 +107,7 @@ def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_qu
             strategy_name = str(raw_worker.get("strategy"))
             model_artifact_path = raw_worker.get("model_artifact_path")
             helformer_artifact_path = raw_worker.get("helformer_artifact_path")
+            use_helformer_forecast = bool(raw_worker.get("use_helformer_forecast", False))
             resolved_model_path = (
                 resolve_model_artifact_path(model_artifact_path)
                 if model_artifact_path is not None and str(model_artifact_path).strip()
@@ -112,7 +115,7 @@ def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_qu
             )
             resolved_helformer_path = (
                 resolve_model_artifact_path(helformer_artifact_path)
-                if helformer_artifact_path is not None and str(helformer_artifact_path).strip()
+                if use_helformer_forecast and helformer_artifact_path is not None and str(helformer_artifact_path).strip()
                 else None
             )
             strategy = create_strategy(
@@ -120,6 +123,7 @@ def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_qu
                 strategy_name=strategy_name,
                 model_artifact_path=resolved_model_path,
                 helformer_artifact_path=resolved_helformer_path,
+                use_helformer_forecast=use_helformer_forecast,
             )
             worker_specs.append(
                 BacktestWorkerSpec(
@@ -128,6 +132,7 @@ def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_qu
                     strategy=strategy,
                     model_artifact_path=str(resolved_model_path) if resolved_model_path else None,
                     helformer_artifact_path=str(resolved_helformer_path) if resolved_helformer_path else None,
+                    use_helformer_forecast=use_helformer_forecast,
                 )
             )
 
@@ -148,4 +153,3 @@ def _read_summary(run_dir: Path) -> dict[str, Any]:
     summary_path = run_dir / "summary.json"
     with summary_path.open("r", encoding="utf-8") as file:
         return json.load(file)
-

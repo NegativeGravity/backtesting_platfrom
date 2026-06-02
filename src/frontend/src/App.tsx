@@ -12,23 +12,12 @@ import { TradesTable } from './components/TradesTable';
 import { WorkerDiagnosticsPanel } from './components/WorkerDiagnosticsPanel';
 import { StatusPill } from './components/StatusPill';
 import { useUiStore } from './stores/uiStore';
+import { STRATEGY_CATALOG } from './strategyCatalog';
 import type { BacktestJobResponse, BacktestJobStatus, BacktestRunListItem, ChartDataResponse, ModelArtifactItem, ReportResponse, RunDetailTab, StrategyName } from './types';
 import { downloadTextFile, reportToHtml } from './utils/exports';
 import { formatDate, formatMoney, formatPercent, getRecord } from './utils/formatters';
 
-const STRATEGIES: Array<{ value: StrategyName; label: string; badge: string; description: string; requiresArtifact: boolean }> = [
-  { value: 'mean_reversion', label: 'Mean Reversion', badge: 'Classic', description: 'Z-score reversal around rolling mean.', requiresArtifact: false },
-  { value: 'adaptive_trend_breakout', label: 'Adaptive Trend', badge: 'Trend', description: 'EMA regime, Donchian breakout, ATR expansion.', requiresArtifact: false },
-  { value: 'liquidity_sweep_reversal', label: 'Liquidity Sweep', badge: 'Sweep', description: 'False-breakout reversal with wick and volume confirmation.', requiresArtifact: false },
-  { value: 'adaptive_trend_expansion_pro', label: 'Trend Expansion Pro', badge: 'Pro', description: 'KAMA, Donchian close, CHOP, Vortex and volatility-targeted trend expansion.', requiresArtifact: false },
-  { value: 'capitulation_reversal_pro', label: 'Capitulation Reversal Pro', badge: 'Pro', description: 'Robust shock, VWAP stretch, Connors RSI and wick-quality reversal.', requiresArtifact: false },
-  { value: 'volatility_squeeze_breakout', label: 'Squeeze Breakout', badge: 'SQZ', description: 'TTM squeeze release with Donchian close breakout and volume expansion.', requiresArtifact: false },
-  { value: 'meta_labeled_alpha_allocator_pro', label: 'Meta Alpha Allocator Pro', badge: 'Meta+', description: 'Regime-aware allocator over trend, capitulation reversal, squeeze and cash.', requiresArtifact: false },
-  { value: 'ml_momentum', label: 'ML Momentum', badge: 'ML', description: 'Causal feature classifier with probability thresholds.', requiresArtifact: true },
-  { value: 'ml_regime_meta_label', label: 'ML Regime Meta', badge: 'Meta', description: 'Regime-aware meta-labeling model.', requiresArtifact: true },
-  { value: 'dl_temporal_fusion_momentum', label: 'DL Temporal Fusion', badge: 'DL', description: 'Sequence model for temporal edge detection.', requiresArtifact: true },
-  { value: 'helformer_momentum', label: 'Helformer Momentum', badge: 'HF', description: 'Regime-calibrated next-close forecast momentum.', requiresArtifact: true },
-];
+const STRATEGIES = STRATEGY_CATALOG;
 
 interface DashboardContext {
   modelArtifactPath: string;
@@ -66,12 +55,14 @@ function DashboardLayout() {
   const [strategy, setStrategy] = useState<StrategyName>('adaptive_trend_breakout');
   const [modelArtifactPath, setModelArtifactPath] = useState('');
   const [helformerArtifactPath, setHelformerArtifactPath] = useState('');
+  const [useHelformerForecast, setUseHelformerForecast] = useState(false);
   const [trackedJobs, setTrackedJobs] = useState<TrackedJob[]>(() => readTrackedJobs());
   const openedRunsRef = useRef<Set<string>>(new Set());
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const currentStrategy = STRATEGIES.find((item) => item.value === strategy) ?? STRATEGIES[0];
-  const usesHelformerProjection = strategy !== 'helformer_momentum';
+  const supportsHelformerForecast = currentStrategy.supportsHelformerForecast;
+  const usesHelformerProjection = supportsHelformerForecast && useHelformerForecast;
   const activeJobs = trackedJobs.filter((job) => !isTerminalBacktestJob(job.status));
   const activeJobIds = useMemo(() => activeJobs.map((job) => job.job_id), [activeJobs]);
 
@@ -126,6 +117,7 @@ function DashboardLayout() {
         config_path: 'configs/backtest.yaml',
         model_artifact_path: currentStrategy.requiresArtifact ? modelArtifactPath.trim() : null,
         helformer_artifact_path: usesHelformerProjection ? helformerArtifactPath.trim() : null,
+        use_helformer_forecast: usesHelformerProjection,
       });
     },
     onSuccess: async (response) => {
@@ -201,6 +193,17 @@ function DashboardLayout() {
                 </button>
               ))}
             </div>
+            {supportsHelformerForecast && (
+              <label className="helformer-toggle">
+                <input
+                  type="checkbox"
+                  checked={useHelformerForecast}
+                  disabled={runMutation.isPending}
+                  onChange={(event) => setUseHelformerForecast(event.target.checked)}
+                />
+                <span>Use Helformer forecast for projected next-bar entries</span>
+              </label>
+            )}
             {usesHelformerProjection && (
               <ArtifactPicker
                 title="Helformer Next-Close Forecaster"

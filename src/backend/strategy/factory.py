@@ -11,11 +11,14 @@ from backend.strategy.capitulation_reversal_pro import CapitulationReversalProSt
 from backend.strategy.dl_temporal_fusion_momentum import DLTemporalFusionMomentumStrategy
 from backend.strategy.helformer_momentum import HelformerMomentumStrategy
 from backend.strategy.helformer_next_bar_projection import HelformerNextBarProjectionStrategy
+from backend.strategy.liquidation_shock_mean_reversion import LiquidationShockMeanReversionStrategy
 from backend.strategy.liquidity_sweep_reversal import LiquiditySweepReversalStrategy
+from backend.strategy.meta_labeled_ensemble_alpha import MetaLabeledEnsembleAlphaStrategy
 from backend.strategy.mean_reversion import MeanReversionStrategy
 from backend.strategy.meta_labeled_alpha_allocator_pro import MetaLabeledAlphaAllocatorProStrategy
 from backend.strategy.ml_momentum import MLMomentumStrategy
 from backend.strategy.ml_regime_meta_label import MLRegimeMetaLabelStrategy
+from backend.strategy.regime_adaptive_btc_trend_breakout import RegimeAdaptiveBtcTrendBreakoutStrategy
 from backend.strategy.volatility_squeeze_breakout import VolatilitySqueezeBreakoutStrategy
 
 
@@ -31,6 +34,9 @@ SUPPORTED_STRATEGIES = {
     "capitulation_reversal_pro",
     "volatility_squeeze_breakout",
     "meta_labeled_alpha_allocator_pro",
+    "regime_adaptive_btc_trend_breakout",
+    "liquidation_shock_mean_reversion",
+    "meta_labeled_ensemble_alpha",
 }
 
 STRATEGIES_REQUIRING_ARTIFACT = {
@@ -40,7 +46,8 @@ STRATEGIES_REQUIRING_ARTIFACT = {
     "helformer_momentum",
 }
 
-STRATEGIES_USING_HELFORMER_FORECASTER = SUPPORTED_STRATEGIES - {"helformer_momentum"}
+STRATEGIES_SUPPORTING_HELFORMER_FORECASTER = SUPPORTED_STRATEGIES - {"helformer_momentum"}
+STRATEGIES_USING_HELFORMER_FORECASTER = STRATEGIES_SUPPORTING_HELFORMER_FORECASTER
 
 
 def create_strategy(
@@ -48,6 +55,7 @@ def create_strategy(
     strategy_name: str | None = None,
     model_artifact_path: Path | str | None = None,
     helformer_artifact_path: Path | str | None = None,
+    use_helformer_forecast: bool = False,
 ) -> Any:
     selected_strategy = strategy_name or _get_config_value(
         config.strategy,
@@ -68,7 +76,7 @@ def create_strategy(
             entry_z_score=float(_get_strategy_parameter(config, "entry_z_score", 2.0)),
             exit_z_score=float(_get_strategy_parameter(config, "exit_z_score", 0.5)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "adaptive_trend_breakout":
         strategy = AdaptiveTrendBreakoutStrategy(
@@ -81,7 +89,7 @@ def create_strategy(
             min_atr_expansion=float(_get_strategy_parameter(config, "min_atr_expansion", 1.05)),
             exit_ema=int(_get_strategy_parameter(config, "exit_ema", 20)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "liquidity_sweep_reversal":
         strategy = LiquiditySweepReversalStrategy(
@@ -97,7 +105,43 @@ def create_strategy(
             exit_zscore=float(_get_strategy_parameter(config, "exit_zscore", 0.10)),
             max_holding_bars=int(_get_strategy_parameter(config, "max_holding_bars", 24)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
+
+    if selected_strategy == "regime_adaptive_btc_trend_breakout":
+        strategy = RegimeAdaptiveBtcTrendBreakoutStrategy(
+            symbol=config.data.symbol,
+            fast_ema=int(_get_strategy_parameter(config, "regime_trend_fast_ema", 50)),
+            slow_ema=int(_get_strategy_parameter(config, "regime_trend_slow_ema", 200)),
+            channel_window=int(_get_strategy_parameter(config, "regime_trend_channel_window", 48)),
+            min_adx=float(_get_strategy_parameter(config, "regime_trend_min_adx", 22.0)),
+            min_volume_z=float(_get_strategy_parameter(config, "regime_trend_min_volume_z", 0.5)),
+            risk_per_trade=float(_get_strategy_parameter(config, "regime_trend_risk_per_trade", 0.006)),
+            max_notional_fraction=float(_get_strategy_parameter(config, "regime_trend_max_notional_fraction", 1.5)),
+        )
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
+
+    if selected_strategy == "liquidation_shock_mean_reversion":
+        strategy = LiquidationShockMeanReversionStrategy(
+            symbol=config.data.symbol,
+            shock_sigma=float(_get_strategy_parameter(config, "liquidation_shock_sigma", 2.5)),
+            min_volume_z=float(_get_strategy_parameter(config, "liquidation_shock_min_volume_z", 2.0)),
+            min_ema_distance_atr=float(_get_strategy_parameter(config, "liquidation_shock_min_ema_distance_atr", 1.25)),
+            risk_per_trade=float(_get_strategy_parameter(config, "liquidation_shock_risk_per_trade", 0.004)),
+            max_notional_fraction=float(_get_strategy_parameter(config, "liquidation_shock_max_notional_fraction", 1.0)),
+            max_holding_bars=int(_get_strategy_parameter(config, "liquidation_shock_max_holding_bars", 6)),
+        )
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
+
+    if selected_strategy == "meta_labeled_ensemble_alpha":
+        strategy = MetaLabeledEnsembleAlphaStrategy(
+            symbol=config.data.symbol,
+            min_probability=float(_get_strategy_parameter(config, "meta_ensemble_min_probability", 0.58)),
+            min_edge_atr=float(_get_strategy_parameter(config, "meta_ensemble_min_edge_atr", 0.12)),
+            high_conviction_probability=float(_get_strategy_parameter(config, "meta_ensemble_high_conviction_probability", 0.65)),
+            fee_rate=float(getattr(config.execution, "fee_rate", 0.0004)),
+            slippage_bps=float(getattr(config.execution, "slippage_bps", 2.0)),
+        )
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "adaptive_trend_expansion_pro":
         strategy = AdaptiveTrendExpansionProStrategy(
@@ -114,7 +158,7 @@ def create_strategy(
             risk_per_trade=float(_get_strategy_parameter(config, "trend_pro_risk_per_trade", 0.005)),
             max_notional_fraction=float(_get_strategy_parameter(config, "trend_pro_max_notional_fraction", 1.5)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "capitulation_reversal_pro":
         strategy = CapitulationReversalProStrategy(
@@ -127,7 +171,7 @@ def create_strategy(
             max_notional_fraction=float(_get_strategy_parameter(config, "capitulation_pro_max_notional_fraction", 1.0)),
             require_confirmation=bool(_get_strategy_parameter(config, "capitulation_pro_require_confirmation", True)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "volatility_squeeze_breakout":
         strategy = VolatilitySqueezeBreakoutStrategy(
@@ -138,7 +182,7 @@ def create_strategy(
             risk_per_trade=float(_get_strategy_parameter(config, "squeeze_risk_per_trade", 0.0045)),
             max_notional_fraction=float(_get_strategy_parameter(config, "squeeze_max_notional_fraction", 1.25)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "meta_labeled_alpha_allocator_pro":
         strategy = MetaLabeledAlphaAllocatorProStrategy(
@@ -149,7 +193,7 @@ def create_strategy(
             fee_rate=float(getattr(config.execution, "fee_rate", 0.0004)),
             slippage_bps=float(getattr(config.execution, "slippage_bps", 2.0)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "ml_momentum":
         artifact_path = _resolve_required_artifact(config, model_artifact_path, selected_strategy)
@@ -163,7 +207,7 @@ def create_strategy(
                 _get_config_value(config.ml, "short_probability_threshold", 1.0 - probability_threshold)
             ),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "ml_regime_meta_label":
         artifact_path = _resolve_required_artifact(config, model_artifact_path, selected_strategy)
@@ -177,7 +221,7 @@ def create_strategy(
             exit_confidence=float(_get_strategy_parameter(config, "ml_regime_exit_confidence", 0.50)),
             max_regime_entropy=float(_get_strategy_parameter(config, "ml_regime_max_entropy", 0.68)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "dl_temporal_fusion_momentum":
         artifact_path = _resolve_required_artifact(config, model_artifact_path, selected_strategy)
@@ -190,7 +234,7 @@ def create_strategy(
             exit_threshold=float(_get_strategy_parameter(config, "dl_exit_threshold", 0.48)),
             max_entropy=float(_get_strategy_parameter(config, "dl_max_entropy", 0.72)),
         )
-        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path)
+        return _wrap_with_helformer_projection(config, selected_strategy, strategy, helformer_artifact_path, use_helformer_forecast)
 
     if selected_strategy == "helformer_momentum":
         artifact_path = _resolve_required_artifact(config, model_artifact_path, selected_strategy)
@@ -212,14 +256,12 @@ def _wrap_with_helformer_projection(
     selected_strategy: str,
     strategy: Any,
     helformer_artifact_path: Path | str | None,
+    use_helformer_forecast: bool,
 ) -> Any:
-    if selected_strategy not in STRATEGIES_USING_HELFORMER_FORECASTER:
+    if not use_helformer_forecast or selected_strategy not in STRATEGIES_SUPPORTING_HELFORMER_FORECASTER:
         return strategy
     if helformer_artifact_path is None or not str(helformer_artifact_path).strip():
-        raise ValueError(
-            f"helformer_artifact_path is required for {selected_strategy}. "
-            "All non-Helformer-native strategies must evaluate projected t+1 conditions through the Helformer next-close forecaster."
-        )
+        raise ValueError(f"helformer_artifact_path is required when Helformer forecast is enabled for {selected_strategy}.")
     artifact_path = resolve_model_artifact_path(helformer_artifact_path)
     return HelformerNextBarProjectionStrategy(
         base_strategy=strategy,

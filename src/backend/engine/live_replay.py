@@ -49,6 +49,7 @@ class LiveStrategyWorkerSpec:
     strategy_name: str
     model_artifact_path: str | None = None
     helformer_artifact_path: str | None = None
+    use_helformer_forecast: bool = False
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,7 @@ class LiveReplayEngine:
                                 "strategy": worker.strategy_name,
                                 "model_artifact_path": worker.model_artifact_path,
                                 "helformer_artifact_path": worker.helformer_artifact_path,
+                                "use_helformer_forecast": worker.use_helformer_forecast,
                             }
                             for worker in robot.strategy_workers
                         ],
@@ -308,6 +310,7 @@ class LiveReplayEngine:
                         "command_queue": command_queue,
                         "response_queue": response_queue,
                         "helformer_artifact_path": worker_spec.helformer_artifact_path,
+                        "use_helformer_forecast": worker_spec.use_helformer_forecast,
                         "shared_market_descriptor": shared_market_descriptor,
                     },
                     daemon=True,

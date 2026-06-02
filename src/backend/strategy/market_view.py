@@ -439,4 +439,3 @@ def _rolling_from_array(values: np.ndarray, window: int, op: str) -> np.ndarray:
     if op == "kurt":
         return rolling.kurt().to_numpy(dtype=np.float64)
     raise ValueError(f"Unsupported rolling operation: {op}")
-

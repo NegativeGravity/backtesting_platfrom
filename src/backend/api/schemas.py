@@ -16,6 +16,9 @@ StrategyName = Literal[
     "capitulation_reversal_pro",
     "volatility_squeeze_breakout",
     "meta_labeled_alpha_allocator_pro",
+    "regime_adaptive_btc_trend_breakout",
+    "liquidation_shock_mean_reversion",
+    "meta_labeled_ensemble_alpha",
 ]
 
 JobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
@@ -31,6 +34,7 @@ class BacktestRunRequest(BaseModel):
     config_path: str = "configs/backtest.yaml"
     model_artifact_path: str | None = None
     helformer_artifact_path: str | None = None
+    use_helformer_forecast: bool = False
 
 
 class BacktestRunResponse(BaseModel):
@@ -82,6 +86,7 @@ class StrategyInfo(BaseModel):
     name: StrategyName
     requires_model_artifact: bool
     requires_helformer_forecaster: bool = False
+    supports_helformer_forecaster: bool = False
 
 
 class CandlePoint(BaseModel):
@@ -143,6 +148,7 @@ class LiveStrategyWorkerConfig(BaseModel):
     strategy: StrategyName
     model_artifact_path: str | None = None
     helformer_artifact_path: str | None = None
+    use_helformer_forecast: bool = False
 
 
 class LiveRobotConfig(BaseModel):

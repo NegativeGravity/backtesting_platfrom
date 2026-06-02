@@ -90,4 +90,3 @@ class SharedMarketDataClient:
             except FileNotFoundError:
                 pass
         self._blocks.clear()
-

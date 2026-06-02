@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { createLiveReplaySocket, runLiveRobotBacktest, startLiveReplay, waitForBacktestJob } from '../api/liveApi';
+import { STRATEGY_CATALOG } from '../strategyCatalog';
 import type { LiveEvent, LiveRobotConfig, LiveStrategyWorkerConfig, StrategyName } from '../types';
 import { formatMoney, formatPercent } from '../utils/formatters';
 import { LiveTradingChart } from './LiveTradingChart';
@@ -15,19 +16,7 @@ interface LiveReplayPanelProps {
   onCompleted: () => void | Promise<void>;
 }
 
-const STRATEGIES: Array<{ value: StrategyName; label: string; artifact: boolean }> = [
-  { value: 'mean_reversion', label: 'Mean Reversion', artifact: false },
-  { value: 'adaptive_trend_breakout', label: 'Adaptive Trend Breakout', artifact: false },
-  { value: 'liquidity_sweep_reversal', label: 'Liquidity Sweep Reversal', artifact: false },
-  { value: 'adaptive_trend_expansion_pro', label: 'Trend Expansion Pro', artifact: false },
-  { value: 'capitulation_reversal_pro', label: 'Capitulation Reversal Pro', artifact: false },
-  { value: 'volatility_squeeze_breakout', label: 'Volatility Squeeze Breakout', artifact: false },
-  { value: 'meta_labeled_alpha_allocator_pro', label: 'Meta Alpha Allocator Pro', artifact: false },
-  { value: 'ml_momentum', label: 'ML Momentum', artifact: true },
-  { value: 'ml_regime_meta_label', label: 'ML Regime Meta Label', artifact: true },
-  { value: 'dl_temporal_fusion_momentum', label: 'DL Temporal Fusion Momentum', artifact: true },
-  { value: 'helformer_momentum', label: 'Helformer Momentum', artifact: true },
-];
+const STRATEGIES = STRATEGY_CATALOG;
 
 type SocketStatus = 'idle' | 'connecting' | 'live' | 'paused' | 'closed' | 'error';
 
@@ -43,8 +32,8 @@ export function LiveReplayPanel({ modelArtifactPath, helformerArtifactPath, onCo
   const [displayName, setDisplayName] = useState('Alpha Robot');
   const [delay, setDelay] = useState(0.02);
   const [workers, setWorkers] = useState<LiveStrategyWorkerConfig[]>([
-    { worker_id: 'trend_1', strategy: 'adaptive_trend_breakout', model_artifact_path: null, helformer_artifact_path: null },
-    { worker_id: 'sweep_1', strategy: 'liquidity_sweep_reversal', model_artifact_path: null, helformer_artifact_path: null },
+    { worker_id: 'trend_1', strategy: 'adaptive_trend_breakout', model_artifact_path: null, helformer_artifact_path: null, use_helformer_forecast: false },
+    { worker_id: 'sweep_1', strategy: 'liquidity_sweep_reversal', model_artifact_path: null, helformer_artifact_path: null, use_helformer_forecast: false },
   ]);
   const [events, setEvents] = useState<LiveEvent[]>([]);
   const [status, setStatus] = useState<SocketStatus>('idle');
@@ -212,6 +201,7 @@ export function LiveReplayPanel({ modelArtifactPath, helformerArtifactPath, onCo
         strategy: 'adaptive_trend_breakout',
         model_artifact_path: null,
         helformer_artifact_path: null,
+        use_helformer_forecast: false,
       },
     ]);
   }
@@ -226,10 +216,11 @@ export function LiveReplayPanel({ modelArtifactPath, helformerArtifactPath, onCo
       display_name: displayName.trim() || 'Alpha Robot',
       strategy_workers: workers.map((worker) => {
         const requiresArtifact = STRATEGIES.some((strategy) => (
-          strategy.value === worker.strategy && strategy.artifact
+          strategy.value === worker.strategy && strategy.requiresArtifact
         ));
 
-        const usesProjection = worker.strategy !== 'helformer_momentum';
+        const supportsProjection = worker.strategy !== 'helformer_momentum';
+        const usesProjection = supportsProjection && Boolean(worker.use_helformer_forecast);
 
         return {
           ...worker,
@@ -240,6 +231,7 @@ export function LiveReplayPanel({ modelArtifactPath, helformerArtifactPath, onCo
           helformer_artifact_path: usesProjection
             ? worker.helformer_artifact_path || helformerArtifactPath || null
             : null,
+          use_helformer_forecast: usesProjection,
         };
       }),
     };
@@ -318,7 +310,13 @@ export function LiveReplayPanel({ modelArtifactPath, helformerArtifactPath, onCo
                 Strategy
                 <select
                   value={worker.strategy}
-                  onChange={(event) => updateWorker(index, { strategy: event.target.value as StrategyName })}
+                  onChange={(event) => {
+                    const nextStrategy = event.target.value as StrategyName;
+                    updateWorker(index, {
+                      strategy: nextStrategy,
+                      use_helformer_forecast: nextStrategy === 'helformer_momentum' ? false : worker.use_helformer_forecast,
+                    });
+                  }}
                 >
                   {STRATEGIES.map((strategy) => (
                     <option key={strategy.value} value={strategy.value}>
@@ -339,16 +337,29 @@ export function LiveReplayPanel({ modelArtifactPath, helformerArtifactPath, onCo
                 />
               </label>
 
-              <label>
-                Helformer Forecaster
-                <input
-                  value={worker.helformer_artifact_path ?? ''}
-                  placeholder="Required for projected next-bar entries"
-                  onChange={(event) => updateWorker(index, {
-                    helformer_artifact_path: event.target.value || null,
-                  })}
-                />
-              </label>
+              {worker.strategy !== 'helformer_momentum' && (
+                <label className="helformer-toggle">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(worker.use_helformer_forecast)}
+                    onChange={(event) => updateWorker(index, { use_helformer_forecast: event.target.checked })}
+                  />
+                  <span>Use Helformer forecast for this worker</span>
+                </label>
+              )}
+
+              {worker.strategy !== 'helformer_momentum' && worker.use_helformer_forecast && (
+                <label>
+                  Helformer Forecaster
+                  <input
+                    value={worker.helformer_artifact_path ?? ''}
+                    placeholder="Required for projected next-bar entries"
+                    onChange={(event) => updateWorker(index, {
+                      helformer_artifact_path: event.target.value || null,
+                    })}
+                  />
+                </label>
+              )}
             </article>
           ))}
         </div>
@@ -493,6 +504,3 @@ function buildStats(events: LiveEvent[]) {
     closes: 0,
   });
 }
-
-
-
