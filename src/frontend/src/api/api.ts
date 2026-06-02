@@ -1,4 +1,5 @@
 import type {
+  BacktestJobResponse,
   BacktestRunListItem,
   BacktestRunRequest,
   BacktestRunResponse,
@@ -7,9 +8,8 @@ import type {
   ReportResponse,
   RobotBacktestRequest,
 } from '../types';
-import { buildHttpUrl } from './config';
-import { request } from './http';
-
+import { buildHttpUrl, JOB_STATUS_TIMEOUT_MS } from './config';
+import { ApiError, request } from './http';
 
 export function listModelArtifacts(signal?: AbortSignal): Promise<ModelArtifactItem[]> {
   return request<ModelArtifactItem[]>('/model-artifacts', { signal });
@@ -41,39 +41,59 @@ export function getChartData(runId: string, signal?: AbortSignal): Promise<Chart
   return request<ChartDataResponse>(`/backtests/${encodeURIComponent(runId)}/chart-data`, { signal });
 }
 
-export function getBacktestJob(jobId: string, signal?: AbortSignal): Promise<BacktestRunResponse> {
-  return request<BacktestRunResponse>(`/jobs/${encodeURIComponent(jobId)}`, { signal });
+export function getBacktestJob(jobId: string, signal?: AbortSignal): Promise<BacktestJobResponse> {
+  return request<BacktestJobResponse>(`/jobs/${encodeURIComponent(jobId)}`, {
+    signal,
+    timeoutMs: JOB_STATUS_TIMEOUT_MS,
+  });
 }
 
-export async function waitForBacktestJob(jobId: string, signal?: AbortSignal): Promise<BacktestRunResponse> {
-  const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
+export function isTerminalBacktestJob(status: unknown): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
+}
+
+export async function waitForBacktestJob(jobId: string, signal?: AbortSignal): Promise<BacktestJobResponse> {
   const startedAt = Date.now();
-  let delayMs = 750;
+  let delayMs = 1000;
+  let transientFailures = 0;
 
   while (true) {
     if (signal?.aborted) throw new Error('Backtest polling was cancelled.');
-    if (Date.now() - startedAt > 15 * 60 * 1000) throw new Error('Backtest job timed out.');
+    if (Date.now() - startedAt > 12 * 60 * 60 * 1000) throw new Error('Backtest job timed out.');
 
-    const job = await getBacktestJob(jobId, signal);
-    if (terminalStatuses.has(String(job.status))) {
-      if (job.status === 'failed' || job.status === 'cancelled') {
-        throw new Error(job.error || `Backtest job ${job.status}.`);
+    try {
+      const job = await getBacktestJob(jobId, signal);
+      transientFailures = 0;
+
+      if (isTerminalBacktestJob(job.status)) {
+        if (job.status === 'failed' || job.status === 'cancelled') {
+          throw new Error(job.error || `Backtest job ${job.status}.`);
+        }
+        if (!job.run_id) {
+          throw new Error('Backtest job completed without a run_id.');
+        }
+        return job;
       }
-      if (!job.run_id) {
-        throw new Error('Backtest job completed without a run_id.');
-      }
-      return job;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error instanceof ApiError && error.status === 404) throw error;
+      transientFailures += 1;
+      if (transientFailures > 40) throw error;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const timeoutId = window.setTimeout(resolve, delayMs);
-      signal?.addEventListener('abort', () => {
-        window.clearTimeout(timeoutId);
-        reject(new Error('Backtest polling was cancelled.'));
-      }, { once: true });
-    });
-    delayMs = Math.min(Math.round(delayMs * 1.35), 5000);
+    await sleep(delayMs, signal);
+    delayMs = Math.min(Math.round(delayMs * 1.25), 15000);
   }
+}
+
+function sleep(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(resolve, delayMs);
+    signal?.addEventListener('abort', () => {
+      window.clearTimeout(timeoutId);
+      reject(new Error('Backtest polling was cancelled.'));
+    }, { once: true });
+  });
 }
 
 export function getBacktestExportUrl(runId: string, format: 'csv' | 'parquet' | 'html'): string {

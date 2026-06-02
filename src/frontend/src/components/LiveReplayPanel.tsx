@@ -11,6 +11,7 @@ import { WorkerDiagnosticsPanel } from './WorkerDiagnosticsPanel';
 
 interface LiveReplayPanelProps {
   modelArtifactPath: string;
+  helformerArtifactPath: string;
   onCompleted: () => void | Promise<void>;
 }
 
@@ -18,14 +19,19 @@ const STRATEGIES: Array<{ value: StrategyName; label: string; artifact: boolean 
   { value: 'mean_reversion', label: 'Mean Reversion', artifact: false },
   { value: 'adaptive_trend_breakout', label: 'Adaptive Trend Breakout', artifact: false },
   { value: 'liquidity_sweep_reversal', label: 'Liquidity Sweep Reversal', artifact: false },
+  { value: 'adaptive_trend_expansion_pro', label: 'Trend Expansion Pro', artifact: false },
+  { value: 'capitulation_reversal_pro', label: 'Capitulation Reversal Pro', artifact: false },
+  { value: 'volatility_squeeze_breakout', label: 'Volatility Squeeze Breakout', artifact: false },
+  { value: 'meta_labeled_alpha_allocator_pro', label: 'Meta Alpha Allocator Pro', artifact: false },
   { value: 'ml_momentum', label: 'ML Momentum', artifact: true },
   { value: 'ml_regime_meta_label', label: 'ML Regime Meta Label', artifact: true },
   { value: 'dl_temporal_fusion_momentum', label: 'DL Temporal Fusion Momentum', artifact: true },
+  { value: 'helformer_momentum', label: 'Helformer Momentum', artifact: true },
 ];
 
 type SocketStatus = 'idle' | 'connecting' | 'live' | 'paused' | 'closed' | 'error';
 
-export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPanelProps) {
+export function LiveReplayPanel({ modelArtifactPath, helformerArtifactPath, onCompleted }: LiveReplayPanelProps) {
   const socketRef = useRef<WebSocket | null>(null);
   const pendingRef = useRef<LiveEvent[]>([]);
   const frameRef = useRef<number | null>(null);
@@ -37,13 +43,14 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
   const [displayName, setDisplayName] = useState('Alpha Robot');
   const [delay, setDelay] = useState(0.02);
   const [workers, setWorkers] = useState<LiveStrategyWorkerConfig[]>([
-    { worker_id: 'trend_1', strategy: 'adaptive_trend_breakout', model_artifact_path: null },
-    { worker_id: 'sweep_1', strategy: 'liquidity_sweep_reversal', model_artifact_path: null },
+    { worker_id: 'trend_1', strategy: 'adaptive_trend_breakout', model_artifact_path: null, helformer_artifact_path: null },
+    { worker_id: 'sweep_1', strategy: 'liquidity_sweep_reversal', model_artifact_path: null, helformer_artifact_path: null },
   ]);
   const [events, setEvents] = useState<LiveEvent[]>([]);
   const [status, setStatus] = useState<SocketStatus>('idle');
   const [paused, setPaused] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [robotBacktestJobId, setRobotBacktestJobId] = useState<string | null>(null);
 
   const stats = useMemo(() => buildStats(events), [events]);
   const latestPortfolio = useMemo(
@@ -144,16 +151,24 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
   });
 
   const robotBacktestMutation = useMutation({
-    mutationFn: async () => {
-      const response = await runLiveRobotBacktest({
-        config_path: 'configs/backtest.yaml',
-        robot: buildRobot(),
-      });
+    mutationFn: () => runLiveRobotBacktest({
+      config_path: 'configs/backtest.yaml',
+      robot: buildRobot(),
+    }),
+    onSuccess: (response) => {
+      setError(null);
+      if (response.run_id || !response.job_id) {
+        void onCompleted();
+        return;
+      }
 
-      return response.run_id || !response.job_id ? response : waitForBacktestJob(response.job_id);
-    },
-    onSuccess: async () => {
-      await onCompleted();
+      setRobotBacktestJobId(response.job_id);
+      void waitForBacktestJob(response.job_id)
+        .then(() => onCompleted())
+        .catch((jobError) => {
+          setError(jobError instanceof Error ? jobError.message : 'Robot backtest failed.');
+        })
+        .finally(() => setRobotBacktestJobId(null));
     },
     onError: (mutationError) => {
       setError(mutationError instanceof Error ? mutationError.message : 'Failed to run robot backtest.');
@@ -196,6 +211,7 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
         worker_id: `worker_${current.length + 1}`,
         strategy: 'adaptive_trend_breakout',
         model_artifact_path: null,
+        helformer_artifact_path: null,
       },
     ]);
   }
@@ -213,11 +229,16 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
           strategy.value === worker.strategy && strategy.artifact
         ));
 
+        const usesProjection = worker.strategy !== 'helformer_momentum';
+
         return {
           ...worker,
           worker_id: worker.worker_id?.trim() || null,
           model_artifact_path: requiresArtifact
             ? worker.model_artifact_path || modelArtifactPath || null
+            : null,
+          helformer_artifact_path: usesProjection
+            ? worker.helformer_artifact_path || helformerArtifactPath || null
             : null,
         };
       }),
@@ -308,12 +329,23 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
               </label>
 
               <label>
-                Artifact
+                Strategy Artifact
                 <input
                   value={worker.model_artifact_path ?? ''}
-                  placeholder="Only for ML/DL"
+                  placeholder="Only for ML/DL/Helformer strategy"
                   onChange={(event) => updateWorker(index, {
                     model_artifact_path: event.target.value || null,
+                  })}
+                />
+              </label>
+
+              <label>
+                Helformer Forecaster
+                <input
+                  value={worker.helformer_artifact_path ?? ''}
+                  placeholder="Required for projected next-bar entries"
+                  onChange={(event) => updateWorker(index, {
+                    helformer_artifact_path: event.target.value || null,
                   })}
                 />
               </label>
@@ -355,7 +387,7 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
             disabled={robotBacktestMutation.isPending}
             onClick={() => robotBacktestMutation.mutate()}
           >
-            {robotBacktestMutation.isPending ? 'Running…' : 'Robot Backtest'}
+            {robotBacktestMutation.isPending ? 'Submitting…' : robotBacktestJobId ? 'Robot Job Running' : 'Robot Backtest'}
           </button>
         </div>
 
@@ -370,6 +402,13 @@ export function LiveReplayPanel({ modelArtifactPath, onCompleted }: LiveReplayPa
           <div className="selected-artifact">
             <span>WebSocket URL</span>
             <b>{websocketUrl}</b>
+          </div>
+        )}
+
+        {robotBacktestJobId && (
+          <div className="selected-artifact">
+            <span>Robot backtest job</span>
+            <b>{robotBacktestJobId}</b>
           </div>
         )}
 
@@ -454,3 +493,6 @@ function buildStats(events: LiveEvent[]) {
     closes: 0,
   });
 }
+
+
+

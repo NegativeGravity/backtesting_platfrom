@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ class SharedMarketDataClient:
         return cls(arrays=arrays, _blocks=blocks)
 
     def market_view(self) -> MarketDataView:
+        base = {"ts", "open", "high", "low", "close", "volume"}
         return MarketDataView.from_arrays(
             ts=self.arrays["ts"],
             open_=self.arrays["open"],
@@ -78,6 +80,7 @@ class SharedMarketDataClient:
             low=self.arrays["low"],
             close=self.arrays["close"],
             volume=self.arrays["volume"],
+            extra={key: value for key, value in self.arrays.items() if key not in base},
         )
 
     def close(self) -> None:
@@ -87,3 +90,4 @@ class SharedMarketDataClient:
             except FileNotFoundError:
                 pass
         self._blocks.clear()
+

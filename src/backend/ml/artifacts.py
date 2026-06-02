@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,10 @@ class ModelArtifact:
     feature_config_path: Path
 
 
-def create_model_artifact_dir(base_dir: Path) -> Path:
-    artifact_dir = base_dir / f"model_{timestamp_for_run_id()}"
+def create_model_artifact_dir(base_dir: Path, artifact_name: str | None = None, overwrite: bool = True) -> Path:
+    artifact_dir = base_dir / _safe_artifact_name(artifact_name) if artifact_name else base_dir / f"model_{timestamp_for_run_id()}"
+    if artifact_dir.exists() and overwrite:
+        shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=False)
     return artifact_dir
 
@@ -62,7 +65,7 @@ def save_model_artifact(
 
 def load_model_bundle(artifact_dir: Path | str) -> dict[str, Any]:
     artifact_path = Path(artifact_dir)
-    model_path = artifact_path / "model.joblib"
+    model_path = artifact_path if artifact_path.is_file() else artifact_path / "model.joblib"
 
     if not model_path.exists():
         available_artifacts = []
@@ -93,6 +96,12 @@ def load_model_bundle(artifact_dir: Path | str) -> dict[str, Any]:
         raise TypeError("Invalid model artifact format. Expected dictionary bundle.")
 
     return bundle
+
+
+def _safe_artifact_name(value: str | None) -> str:
+    name = str(value or "model").strip().replace("\\", "/").split("/")[-1]
+    safe = "".join(char if char.isalnum() or char in {"_", "-", "."} else "_" for char in name)
+    return safe.strip("._") or "model"
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

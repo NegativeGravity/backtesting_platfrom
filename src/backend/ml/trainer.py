@@ -85,7 +85,7 @@ def train_ml_momentum_model(
         threshold=selected_threshold,
     )
 
-    artifact_dir = create_model_artifact_dir(config.ml.model_artifact_dir)
+    artifact_dir = create_model_artifact_dir(config.ml.model_artifact_dir, artifact_name="ml_momentum")
 
     model_bundle = {
         "model": model,
@@ -202,3 +202,13 @@ def _classification_metrics(
         metrics["roc_auc"] = None
 
     return metrics
+
+
+
+def train_helformer_momentum_model(
+    data: pd.DataFrame,
+    config: AppConfig,
+):
+    from backend.ml.helformer import train_helformer_next_close_model
+
+    return train_helformer_next_close_model(data=data, config=config)

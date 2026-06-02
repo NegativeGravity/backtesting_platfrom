@@ -13,6 +13,8 @@ from urllib.request import urlopen
 
 DEFAULT_MARKET_CONFIG = "configs/market_data.docker.yaml"
 DEFAULT_SPLIT_POLICY = "recommended"
+FRONTEND_CONTEXT = "./src/frontend"
+BACKEND_CONTEXT = "./src/backend"
 
 REQUIRED_IMAGES = [
     "trading-platform-backend",
@@ -102,22 +104,36 @@ def ensure_project_root() -> Path:
     return root
 
 
+def check_source_layout(root: Path) -> None:
+    expected_paths = [
+        root / "src" / "backend",
+        root / "src" / "frontend",
+    ]
+
+    for path in expected_paths:
+        if path.exists():
+            log_ok(f"Source path exists: {path.relative_to(root).as_posix()}")
+        else:
+            log_warn(f"Source path not found: {path.relative_to(root).as_posix()}")
+
+
 def ensure_env_file(root: Path) -> None:
     env_path = root / ".env"
-    env_example = root / ".env"
+    env_example = root / ".env.example"
 
     if env_path.exists():
         return
 
     if env_example.exists():
         shutil.copyfile(env_example, env_path)
-        log_ok(".env created from .env")
+        log_ok(".env created from .env.example")
         return
 
     env_path.write_text(
         "\n".join(
             [
-                "FRONTEND_CONTEXT=./src/frontend",
+                f"BACKEND_CONTEXT={BACKEND_CONTEXT}",
+                f"FRONTEND_CONTEXT={FRONTEND_CONTEXT}",
                 "FRONTEND_PORT=3000",
                 "BACKEND_PORT=8000",
                 "QUESTDB_VERSION=latest",
@@ -330,6 +346,61 @@ def train_dl_temporal(
     )
 
 
+def train_helformer(
+        config: str,
+        split_policy: str,
+        *,
+        script: str,
+        window_size: int,
+        forecast_horizon: int,
+        purge_hours: int,
+        folds: int,
+        validation_days: int,
+        max_train_samples: int,
+        max_validation_samples: int,
+        n_trials: int,
+        tuning_epochs: int,
+        final_epochs_cap: int,
+        prediction_batch_size: int,
+        allow_short: bool,
+) -> None:
+    log_step("Training Helformer Next Close model")
+    command = [
+        script,
+        "--market-config",
+        config,
+        "--split-policy",
+        split_policy,
+        "--window-size",
+        str(window_size),
+        "--forecast-horizon",
+        str(forecast_horizon),
+        "--purge-hours",
+        str(purge_hours),
+        "--folds",
+        str(folds),
+        "--validation-days",
+        str(validation_days),
+        "--max-train-samples",
+        str(max_train_samples),
+        "--max-validation-samples",
+        str(max_validation_samples),
+        "--n-trials",
+        str(n_trials),
+        "--tuning-epochs",
+        str(tuning_epochs),
+        "--final-epochs-cap",
+        str(final_epochs_cap),
+        "--prediction-batch-size",
+        str(prediction_batch_size),
+    ]
+
+    if allow_short:
+        command.append("--allow-short")
+
+    run_backend_python(command)
+
+
 def train_models(
         config: str,
         split_policy: str,
@@ -337,9 +408,23 @@ def train_models(
         train_ml: bool,
         train_regime: bool,
         train_dl: bool,
-        epochs: int,
-        sequence_length: int,
-        batch_size: int,
+        train_helformer_model: bool,
+        dl_epochs: int,
+        dl_sequence_length: int,
+        dl_batch_size: int,
+        helformer_script: str,
+        helformer_window_size: int,
+        helformer_forecast_horizon: int,
+        helformer_purge_hours: int,
+        helformer_folds: int,
+        helformer_validation_days: int,
+        helformer_max_train_samples: int,
+        helformer_max_validation_samples: int,
+        helformer_n_trials: int,
+        helformer_tuning_epochs: int,
+        helformer_final_epochs_cap: int,
+        helformer_prediction_batch_size: int,
+        helformer_allow_short: bool,
 ) -> None:
     if train_ml:
         train_ml_momentum(config, split_policy)
@@ -351,9 +436,28 @@ def train_models(
         train_dl_temporal(
             config,
             split_policy,
-            epochs=epochs,
-            sequence_length=sequence_length,
-            batch_size=batch_size,
+            epochs=dl_epochs,
+            sequence_length=dl_sequence_length,
+            batch_size=dl_batch_size,
+        )
+
+    if train_helformer_model:
+        train_helformer(
+            config,
+            split_policy,
+            script=helformer_script,
+            window_size=helformer_window_size,
+            forecast_horizon=helformer_forecast_horizon,
+            purge_hours=helformer_purge_hours,
+            folds=helformer_folds,
+            validation_days=helformer_validation_days,
+            max_train_samples=helformer_max_train_samples,
+            max_validation_samples=helformer_max_validation_samples,
+            n_trials=helformer_n_trials,
+            tuning_epochs=helformer_tuning_epochs,
+            final_epochs_cap=helformer_final_epochs_cap,
+            prediction_batch_size=helformer_prediction_batch_size,
+            allow_short=helformer_allow_short,
         )
 
 
@@ -444,7 +548,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-all",
         action="store_true",
-        help="Train all models: ml_momentum, ml_regime_meta_label, dl_temporal_fusion_momentum.",
+        help="Train all models: ml_momentum, ml_regime_meta_label, dl_temporal_fusion_momentum, helformer_momentum.",
     )
     parser.add_argument(
         "--train-ml",
@@ -460,6 +564,11 @@ def parse_args() -> argparse.Namespace:
         "--train-dl",
         action="store_true",
         help="Train only DL Temporal Fusion Momentum.",
+    )
+    parser.add_argument(
+        "--train-helformer",
+        action="store_true",
+        help="Train only Helformer Momentum / Next Close model.",
     )
 
     parser.add_argument(
@@ -479,6 +588,84 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=128,
         help="DL batch size.",
+    )
+
+
+    parser.add_argument(
+        "--helformer-script",
+        default="scripts/train_helformer_next_close_model.py",
+        help="Helformer training script path inside backend container.",
+    )
+    parser.add_argument(
+        "--helformer-window-size",
+        type=int,
+        default=24,
+        help="Helformer lookback window size.",
+    )
+    parser.add_argument(
+        "--helformer-forecast-horizon",
+        type=int,
+        default=1,
+        help="Helformer forecast horizon.",
+    )
+    parser.add_argument(
+        "--helformer-purge-hours",
+        type=int,
+        default=48,
+        help="Helformer purge gap in hours.",
+    )
+    parser.add_argument(
+        "--helformer-folds",
+        type=int,
+        default=2,
+        help="Helformer walk-forward folds.",
+    )
+    parser.add_argument(
+        "--helformer-validation-days",
+        type=int,
+        default=120,
+        help="Helformer validation days per fold.",
+    )
+    parser.add_argument(
+        "--helformer-max-train-samples",
+        type=int,
+        default=6000,
+        help="Helformer max train samples per fold.",
+    )
+    parser.add_argument(
+        "--helformer-max-validation-samples",
+        type=int,
+        default=1800,
+        help="Helformer max validation samples per fold.",
+    )
+    parser.add_argument(
+        "--helformer-n-trials",
+        type=int,
+        default=5,
+        help="Helformer Optuna trial count.",
+    )
+    parser.add_argument(
+        "--helformer-tuning-epochs",
+        type=int,
+        default=8,
+        help="Helformer tuning epochs.",
+    )
+    parser.add_argument(
+        "--helformer-final-epochs-cap",
+        type=int,
+        default=14,
+        help="Helformer final training epoch cap.",
+    )
+    parser.add_argument(
+        "--helformer-prediction-batch-size",
+        type=int,
+        default=512,
+        help="Helformer prediction batch size.",
+    )
+    parser.add_argument(
+        "--helformer-allow-short",
+        action="store_true",
+        help="Enable short side for Helformer strategy artifacts.",
     )
 
     parser.add_argument(
@@ -512,6 +699,7 @@ def main() -> int:
     try:
         check_required_tools()
         ensure_env_file(root)
+        check_source_layout(root)
 
         if not args.skip_start:
             start_services(
@@ -533,17 +721,32 @@ def main() -> int:
         train_ml = args.train_all or args.train_ml
         train_regime = args.train_all or args.train_regime
         train_dl = args.train_all or args.train_dl
+        train_helformer_model = args.train_all or args.train_helformer
 
-        if train_ml or train_regime or train_dl:
+        if train_ml or train_regime or train_dl or train_helformer_model:
             train_models(
                 args.market_config,
                 args.split_policy,
                 train_ml=train_ml,
                 train_regime=train_regime,
                 train_dl=train_dl,
-                epochs=args.dl_epochs,
-                sequence_length=args.dl_sequence_length,
-                batch_size=args.dl_batch_size,
+                train_helformer_model=train_helformer_model,
+                dl_epochs=args.dl_epochs,
+                dl_sequence_length=args.dl_sequence_length,
+                dl_batch_size=args.dl_batch_size,
+                helformer_script=args.helformer_script,
+                helformer_window_size=args.helformer_window_size,
+                helformer_forecast_horizon=args.helformer_forecast_horizon,
+                helformer_purge_hours=args.helformer_purge_hours,
+                helformer_folds=args.helformer_folds,
+                helformer_validation_days=args.helformer_validation_days,
+                helformer_max_train_samples=args.helformer_max_train_samples,
+                helformer_max_validation_samples=args.helformer_max_validation_samples,
+                helformer_n_trials=args.helformer_n_trials,
+                helformer_tuning_epochs=args.helformer_tuning_epochs,
+                helformer_final_epochs_cap=args.helformer_final_epochs_cap,
+                helformer_prediction_batch_size=args.helformer_prediction_batch_size,
+                helformer_allow_short=args.helformer_allow_short,
             )
 
         print_final_message()

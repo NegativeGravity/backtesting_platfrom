@@ -23,7 +23,8 @@ export const WS_BASE_URL = stripWsSuffix(trimTrailingSlash(
   envWs || (API_BASE_URL.startsWith('http') ? API_BASE_URL.replace(/^http/, 'ws').replace(/\/api$/, '') : ''),
 ));
 
-export const REQUEST_TIMEOUT_MS = readNumber(import.meta.env.VITE_REQUEST_TIMEOUT_MS, 30000);
+export const REQUEST_TIMEOUT_MS = Math.max(readNumber(import.meta.env.VITE_REQUEST_TIMEOUT_MS, 600000), 600000);
+export const JOB_STATUS_TIMEOUT_MS = Math.max(readNumber(import.meta.env.VITE_JOB_STATUS_TIMEOUT_MS, 60000), 60000);
 
 export function buildHttpUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;

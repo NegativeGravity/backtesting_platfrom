@@ -15,6 +15,7 @@ from backend.backtest.metrics import calculate_metrics
 from backend.backtest.report import BacktestReportWriter
 from backend.core.config import load_config
 from backend.core.paths import resolve_model_artifact_path
+from backend.strategy.factory import STRATEGIES_REQUIRING_ARTIFACT
 from backend.core.time import timestamp_for_run_id
 from backend.data.validator import validate_ohlcv
 from backend.engine.bot_worker import run_bot_worker
@@ -47,6 +48,7 @@ class LiveStrategyWorkerSpec:
     worker_id: str
     strategy_name: str
     model_artifact_path: str | None = None
+    helformer_artifact_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,8 @@ class PendingLiveOrder:
     worker_id: str
     strategy_name: str
     target_notional_fraction: float
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
 
 
 @dataclass
@@ -172,6 +176,7 @@ class LiveReplayEngine:
                                 "worker_id": worker.worker_id,
                                 "strategy": worker.strategy_name,
                                 "model_artifact_path": worker.model_artifact_path,
+                                "helformer_artifact_path": worker.helformer_artifact_path,
                             }
                             for worker in robot.strategy_workers
                         ],
@@ -284,10 +289,10 @@ class LiveReplayEngine:
 
                 model_path = None
 
-                if worker_spec.strategy_name == "ml_momentum":
+                if worker_spec.strategy_name in STRATEGIES_REQUIRING_ARTIFACT:
                     if worker_spec.model_artifact_path is None:
                         raise ValueError(
-                            f"Worker {worker_spec.worker_id} uses ml_momentum "
+                            f"Worker {worker_spec.worker_id} uses {worker_spec.strategy_name} "
                             "but model_artifact_path is missing."
                         )
 
@@ -302,6 +307,7 @@ class LiveReplayEngine:
                         "model_artifact_path": model_path,
                         "command_queue": command_queue,
                         "response_queue": response_queue,
+                        "helformer_artifact_path": worker_spec.helformer_artifact_path,
                         "shared_market_descriptor": shared_market_descriptor,
                     },
                     daemon=True,
@@ -566,8 +572,10 @@ class LiveReplayEngine:
                     signal_time=signal.timestamp,
                     reason=signal.reason,
                 ),
-                target_notional_fraction=self._capital_fraction,
+                target_notional_fraction=self._target_fraction_from_signal(signal),
                 current_price=current_price,
+                stop_loss_pct=_positive_metadata_float(signal.metadata, "stop_loss_pct"),
+                take_profit_pct=_positive_metadata_float(signal.metadata, "take_profit_pct"),
             )
             return
 
@@ -591,8 +599,10 @@ class LiveReplayEngine:
                     signal_time=signal.timestamp,
                     reason=signal.reason,
                 ),
-                target_notional_fraction=self._capital_fraction,
+                target_notional_fraction=self._target_fraction_from_signal(signal),
                 current_price=current_price,
+                stop_loss_pct=_positive_metadata_float(signal.metadata, "stop_loss_pct"),
+                take_profit_pct=_positive_metadata_float(signal.metadata, "take_profit_pct"),
             )
             return
 
@@ -634,6 +644,8 @@ class LiveReplayEngine:
         order: LiveOrderIntent,
         target_notional_fraction: float,
         current_price: float,
+        stop_loss_pct: float | None = None,
+        take_profit_pct: float | None = None,
     ) -> None:
         robot_runtime.pending_orders.append(
             PendingLiveOrder(
@@ -641,6 +653,8 @@ class LiveReplayEngine:
                 worker_id=worker_runtime.worker_id,
                 strategy_name=worker_runtime.strategy_name,
                 target_notional_fraction=target_notional_fraction,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
             )
         )
 
@@ -825,12 +839,15 @@ class LiveReplayEngine:
     ) -> None:
         order = pending.order
 
+        stop_loss_pct = pending.stop_loss_pct if pending.stop_loss_pct is not None and pending.stop_loss_pct > 0.0 else self._stop_loss_pct
+        take_profit_pct = pending.take_profit_pct if pending.take_profit_pct is not None and pending.take_profit_pct > 0.0 else self._take_profit_pct
+
         if side == PositionSide.LONG:
-            stop_loss = fill_price * (1.0 - self._stop_loss_pct)
-            take_profit = fill_price * (1.0 + self._take_profit_pct)
+            stop_loss = fill_price * (1.0 - stop_loss_pct)
+            take_profit = fill_price * (1.0 + take_profit_pct)
         else:
-            stop_loss = fill_price * (1.0 + self._stop_loss_pct)
-            take_profit = fill_price * (1.0 - self._take_profit_pct)
+            stop_loss = fill_price * (1.0 + stop_loss_pct)
+            take_profit = fill_price * (1.0 - take_profit_pct)
 
         open_position = OpenPosition(
             position_id=f"{robot_runtime.robot_id}_{pending.worker_id}_{order.symbol}_{timestamp.isoformat()}",
@@ -1373,3 +1390,19 @@ class LiveReplayEngine:
                 safe_record[key] = str(value)
 
         return safe_record
+
+
+
+
+
+
+def _positive_metadata_float(metadata: dict[str, Any] | None, key: str) -> float | None:
+    if not isinstance(metadata, dict):
+        return None
+    try:
+        value = float(metadata.get(key))
+    except (TypeError, ValueError):
+        return None
+    if value > 0.0:
+        return value
+    return None

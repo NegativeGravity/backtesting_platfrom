@@ -6,7 +6,14 @@ export type StrategyName =
   | 'adaptive_trend_breakout'
   | 'liquidity_sweep_reversal'
   | 'ml_regime_meta_label'
-  | 'dl_temporal_fusion_momentum';
+  | 'dl_temporal_fusion_momentum'
+  | 'helformer_momentum'
+  | 'adaptive_trend_expansion_pro'
+  | 'capitulation_reversal_pro'
+  | 'volatility_squeeze_breakout'
+  | 'meta_labeled_alpha_allocator_pro';
+
+export type BacktestJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 export interface BacktestRunListItem {
   run_id: string;
@@ -24,6 +31,7 @@ export interface BacktestRunRequest {
   strategy: StrategyName;
   config_path: string;
   model_artifact_path?: string | null;
+  helformer_artifact_path?: string | null;
 }
 
 export interface BacktestRunResponse {
@@ -31,14 +39,34 @@ export interface BacktestRunResponse {
   run_dir?: string | null;
   summary?: JsonRecord;
   job_id?: string | null;
-  status?: string | null;
+  status?: BacktestJobStatus | string | null;
   error?: string | null;
+  message?: string | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+  heartbeat_at?: number | null;
+  elapsed_seconds?: number | null;
+}
+
+export interface BacktestJobResponse {
+  job_id: string;
+  status: BacktestJobStatus;
+  run_id?: string | null;
+  run_dir?: string | null;
+  summary?: JsonRecord;
+  error?: string | null;
+  message?: string | null;
+  created_at: number;
+  updated_at: number;
+  heartbeat_at?: number | null;
+  elapsed_seconds: number;
 }
 
 export interface LiveStrategyWorkerConfig {
   worker_id?: string | null;
   strategy: StrategyName;
   model_artifact_path?: string | null;
+  helformer_artifact_path?: string | null;
 }
 
 export interface LiveRobotConfig {
@@ -143,6 +171,9 @@ export interface ModelArtifactItem {
   name: string;
   size_bytes: number;
   modified_at: string;
+  strategy?: string | null;
+  artifact_role?: string | null;
+  model_type?: string | null;
 }
 
 export interface ReportResponse {

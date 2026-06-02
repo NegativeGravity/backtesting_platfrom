@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ class MarketArrays:
     low: np.ndarray
     close: np.ndarray
     volume: np.ndarray
+    extra: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -50,6 +52,7 @@ class MarketDataView:
                 low=arrays["low"],
                 close=arrays["close"],
                 volume=arrays["volume"],
+                extra={key: value for key, value in arrays.items() if key not in {"ts", "open", "high", "low", "close", "volume"}},
             )
         )
 
@@ -63,8 +66,9 @@ class MarketDataView:
         low: np.ndarray,
         close: np.ndarray,
         volume: np.ndarray,
+        extra: dict[str, np.ndarray] | None = None,
     ) -> "MarketDataView":
-        return cls(MarketArrays(ts=ts, open=open_, high=high, low=low, close=close, volume=volume))
+        return cls(MarketArrays(ts=ts, open=open_, high=high, low=low, close=close, volume=volume, extra=extra or {}))
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "MarketDataView":
@@ -75,6 +79,7 @@ class MarketDataView:
             low=np.asarray(payload["low"], dtype=np.float64),
             close=np.asarray(payload["close"], dtype=np.float64),
             volume=np.asarray(payload.get("volume", []), dtype=np.float64),
+            extra={key: np.asarray(value) for key, value in dict(payload.get("extra", {})).items()},
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -85,6 +90,7 @@ class MarketDataView:
             "low": self.arrays.low.tolist(),
             "close": self.arrays.close.tolist(),
             "volume": self.arrays.volume.tolist(),
+            "extra": {key: value.tolist() for key, value in self.arrays.extra.items()},
         }
 
     def __len__(self) -> int:
@@ -104,16 +110,17 @@ class MarketDataView:
         span = int(lookback or DEFAULT_FALLBACK_LOOKBACK)
         start = max(0, safe_index + 1 - span)
         stop = safe_index + 1
-        return pd.DataFrame(
-            {
-                "timestamp": pd.to_datetime(self.arrays.ts[start:stop], utc=True),
-                "open": self.arrays.open[start:stop],
-                "high": self.arrays.high[start:stop],
-                "low": self.arrays.low[start:stop],
-                "close": self.arrays.close[start:stop],
-                "volume": self.arrays.volume[start:stop],
-            }
-        )
+        data = {
+            "timestamp": pd.to_datetime(self.arrays.ts[start:stop], utc=True),
+            "open": self.arrays.open[start:stop],
+            "high": self.arrays.high[start:stop],
+            "low": self.arrays.low[start:stop],
+            "close": self.arrays.close[start:stop],
+            "volume": self.arrays.volume[start:stop],
+        }
+        for column, values in self.arrays.extra.items():
+            data[column] = values[start:stop]
+        return pd.DataFrame(data)
 
     def value(self, column: str, index: int) -> float:
         return float(getattr(self.arrays, column)[index])
@@ -392,7 +399,7 @@ def frame_to_market_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
         normalized = normalized.rename(columns={"ts": "timestamp"})
     timestamps = pd.to_datetime(normalized["timestamp"], utc=True).astype("int64").to_numpy(dtype=np.int64)
     volume = normalized["volume"].to_numpy(dtype=np.float64, copy=True) if "volume" in normalized.columns else np.zeros(len(normalized), dtype=np.float64)
-    return {
+    arrays = {
         "ts": timestamps,
         "open": normalized["open"].to_numpy(dtype=np.float64, copy=True),
         "high": normalized["high"].to_numpy(dtype=np.float64, copy=True),
@@ -400,6 +407,14 @@ def frame_to_market_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
         "close": normalized["close"].to_numpy(dtype=np.float64, copy=True),
         "volume": volume,
     }
+    base_columns = {"timestamp", "ts", "open", "high", "low", "close", "volume"}
+    for column in normalized.columns:
+        if column in base_columns:
+            continue
+        values = pd.to_numeric(normalized[column], errors="coerce")
+        if values.notna().any():
+            arrays[column] = values.fillna(0.0).to_numpy(dtype=np.float64, copy=True)
+    return arrays
 
 
 def _safe_denominator(value: float, fallback: float = np.nan) -> float:
@@ -424,3 +439,4 @@ def _rolling_from_array(values: np.ndarray, window: int, op: str) -> np.ndarray:
     if op == "kurt":
         return rolling.kurt().to_numpy(dtype=np.float64)
     raise ValueError(f"Unsupported rolling operation: {op}")
+

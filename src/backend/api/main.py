@@ -33,7 +33,7 @@ from backend.api.services.report_repository import ReportRepository
 from backend.core.config import load_config
 from backend.core.logging import setup_logging
 from backend.engine.live_replay import LiveRobotSpec, LiveStrategyWorkerSpec
-from backend.strategy.factory import STRATEGIES_REQUIRING_ARTIFACT, SUPPORTED_STRATEGIES
+from backend.strategy.factory import STRATEGIES_REQUIRING_ARTIFACT, STRATEGIES_USING_HELFORMER_FORECASTER, SUPPORTED_STRATEGIES
 from backend.utils.ids import new_id
 
 from pathlib import Path
@@ -62,6 +62,38 @@ job_manager = BacktestJobManager()
 live_sessions = LiveSessionManager()
 
 
+def _job_response(job) -> BacktestJobResponse:
+    return BacktestJobResponse(
+        job_id=job.job_id,
+        status=job.status,
+        run_id=job.run_id,
+        run_dir=job.run_dir,
+        summary=job.summary,
+        error=job.error,
+        message=job.message,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        heartbeat_at=job.heartbeat_at,
+        elapsed_seconds=job.elapsed_seconds,
+    )
+
+
+def _job_run_response(job) -> BacktestRunResponse:
+    return BacktestRunResponse(
+        job_id=job.job_id,
+        status=job.status,
+        run_id=job.run_id,
+        run_dir=job.run_dir,
+        summary=job.summary,
+        error=job.error,
+        message=job.message,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        heartbeat_at=job.heartbeat_at,
+        elapsed_seconds=job.elapsed_seconds,
+    )
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", service="trading-backtesting-platform-api")
@@ -79,12 +111,23 @@ def list_datasets() -> list[DatasetInfo]:
     ]
 
 
+def _validate_strategy_artifacts(strategy: str, model_artifact_path: str | None, helformer_artifact_path: str | None) -> None:
+    if strategy in STRATEGIES_REQUIRING_ARTIFACT and not str(model_artifact_path or "").strip():
+        raise HTTPException(status_code=400, detail=f"model_artifact_path is required for {strategy}.")
+    if strategy in STRATEGIES_USING_HELFORMER_FORECASTER and not str(helformer_artifact_path or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail=f"helformer_artifact_path is required for {strategy}. All non-Helformer-native strategies must evaluate projected t+1 conditions through the Helformer next-close forecaster.",
+        )
+
+
 @app.get("/strategies", response_model=list[StrategyInfo])
 def list_strategies() -> list[StrategyInfo]:
     return [
         StrategyInfo(
             name=strategy_name,  # type: ignore[arg-type]
             requires_model_artifact=strategy_name in STRATEGIES_REQUIRING_ARTIFACT,
+            requires_helformer_forecaster=strategy_name in STRATEGIES_USING_HELFORMER_FORECASTER,
         )
         for strategy_name in sorted(SUPPORTED_STRATEGIES)
     ]
@@ -92,19 +135,23 @@ def list_strategies() -> list[StrategyInfo]:
 
 @app.post("/backtests/run", response_model=BacktestRunResponse)
 def run_backtest(request: BacktestRunRequest) -> BacktestRunResponse:
+    _validate_strategy_artifacts(request.strategy, request.model_artifact_path, request.helformer_artifact_path)
     job = job_manager.submit(
         lambda cancel_event: run_backtest_from_request(
             config_path=request.config_path,
             strategy_name=request.strategy,
             model_artifact_path=request.model_artifact_path,
+            helformer_artifact_path=request.helformer_artifact_path,
             cancel_event=cancel_event,
         )
     )
-    return BacktestRunResponse(job_id=job.job_id, status=job.status)
+    return _job_run_response(job)
 
 
 @app.post("/robot-backtests/run", response_model=BacktestRunResponse)
 def run_robot_backtest(request: RobotBacktestRequest) -> BacktestRunResponse:
+    for worker in request.robot.strategy_workers:
+        _validate_strategy_artifacts(worker.strategy, worker.model_artifact_path, worker.helformer_artifact_path)
     robot_payload = {
         "robot_id": request.robot.robot_id,
         "display_name": request.robot.display_name,
@@ -113,6 +160,7 @@ def run_robot_backtest(request: RobotBacktestRequest) -> BacktestRunResponse:
                 "worker_id": worker.worker_id or new_id(f"worker_{worker.strategy}"),
                 "strategy": worker.strategy,
                 "model_artifact_path": worker.model_artifact_path,
+                "helformer_artifact_path": worker.helformer_artifact_path,
             }
             for worker in request.robot.strategy_workers
         ],
@@ -124,7 +172,7 @@ def run_robot_backtest(request: RobotBacktestRequest) -> BacktestRunResponse:
             cancel_event=cancel_event,
         )
     )
-    return BacktestRunResponse(job_id=job.job_id, status=job.status)
+    return _job_run_response(job)
 
 
 @app.get("/jobs/{job_id}", response_model=BacktestJobResponse)
@@ -132,14 +180,7 @@ def get_job(job_id: str) -> BacktestJobResponse:
     job = job_manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return BacktestJobResponse(
-        job_id=job.job_id,
-        status=job.status,
-        run_id=job.run_id,
-        run_dir=job.run_dir,
-        summary=job.summary,
-        error=job.error,
-    )
+    return _job_response(job)
 
 
 @app.post("/jobs/{job_id}/cancel", response_model=BacktestJobResponse)
@@ -147,14 +188,7 @@ def cancel_job(job_id: str) -> BacktestJobResponse:
     job = job_manager.cancel(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return BacktestJobResponse(
-        job_id=job.job_id,
-        status=job.status,
-        run_id=job.run_id,
-        run_dir=job.run_dir,
-        summary=job.summary,
-        error=job.error,
-    )
+    return _job_response(job)
 
 
 @app.get("/backtests", response_model=list[BacktestRunListItem])
@@ -210,6 +244,10 @@ def export_backtest(run_id: str, format: Literal["csv", "parquet", "html"] = "cs
 @app.post("/live-replay/start", response_model=LiveReplayResponse)
 def start_live_replay(request: LiveReplayRequest) -> LiveReplayResponse:
     try:
+        for robot in request.robots:
+            for worker in robot.strategy_workers:
+                _validate_strategy_artifacts(worker.strategy, worker.model_artifact_path, worker.helformer_artifact_path)
+
         robot_specs = [
             LiveRobotSpec(
                 robot_id=robot.robot_id,
@@ -219,6 +257,7 @@ def start_live_replay(request: LiveReplayRequest) -> LiveReplayResponse:
                         worker_id=worker.worker_id or new_id(f"worker_{worker.strategy}"),
                         strategy_name=worker.strategy,
                         model_artifact_path=worker.model_artifact_path,
+                        helformer_artifact_path=worker.helformer_artifact_path,
                     )
                     for worker in robot.strategy_workers
                 ],
@@ -294,7 +333,7 @@ async def live_replay_websocket(websocket: WebSocket, session_id: str) -> None:
 
 
 @app.get("/model-artifacts")
-def list_model_artifacts() -> list[dict[str, str | int]]:
+def list_model_artifacts() -> list[dict[str, str | int | None]]:
     roots = [
         get_project_root() / "outputs" / "models",
         get_project_root() / "models",
@@ -308,30 +347,84 @@ def list_model_artifacts() -> list[dict[str, str | int]]:
         ".pt",
         ".pth",
         ".onnx",
+        ".keras",
     }
 
-    artifacts: list[dict[str, str | int]] = []
+    artifacts: list[dict[str, str | int | None]] = []
+    seen: set[str] = set()
 
     for root in roots:
         if not root.exists() or not root.is_dir():
             continue
 
         for path in root.rglob("*"):
+            if path.is_dir() and _looks_like_model_artifact_dir(path):
+                relative_path = path.relative_to(get_project_root()).as_posix()
+                if relative_path in seen:
+                    continue
+                seen.add(relative_path)
+                metadata = _read_artifact_metadata(path)
+                artifacts.append({
+                    "path": relative_path,
+                    "name": str(metadata.get("artifact_name") or metadata.get("artifact_role") or metadata.get("strategy") or path.name),
+                    "size_bytes": _directory_size(path),
+                    "modified_at": str(int(max((item.stat().st_mtime for item in path.rglob("*") if item.is_file()), default=path.stat().st_mtime))),
+                    "strategy": None if metadata.get("strategy") is None else str(metadata.get("strategy")),
+                    "artifact_role": None if metadata.get("artifact_role") is None else str(metadata.get("artifact_role")),
+                    "model_type": None if metadata.get("model_type") is None else str(metadata.get("model_type")),
+                })
+
+        for path in root.rglob("*"):
             if not path.is_file():
                 continue
-
             if path.suffix.lower() not in allowed_suffixes:
                 continue
-
+            if _is_inside_artifact_dir(path):
+                continue
             relative_path = path.relative_to(get_project_root()).as_posix()
+            if relative_path in seen:
+                continue
+            seen.add(relative_path)
             stat = path.stat()
-
             artifacts.append({
                 "path": relative_path,
                 "name": path.name,
                 "size_bytes": stat.st_size,
                 "modified_at": str(int(stat.st_mtime)),
+                "strategy": None,
+                "artifact_role": None,
+                "model_type": None,
             })
 
-    artifacts.sort(key=lambda item: int(item["modified_at"]), reverse=True)
+    artifacts.sort(key=lambda item: int(item["modified_at"] or 0), reverse=True)
     return artifacts
+
+
+def _looks_like_model_artifact_dir(path: Path) -> bool:
+    return (path / "metadata.json").exists() and (
+        (path / "model.joblib").exists()
+        or (path / "model.keras").exists()
+        or any(child.suffix.lower() in {".pt", ".pth", ".onnx", ".keras"} for child in path.iterdir() if child.is_file())
+    )
+
+
+def _is_inside_artifact_dir(path: Path) -> bool:
+    return any(_looks_like_model_artifact_dir(parent) for parent in path.parents if parent != get_project_root())
+
+
+def _directory_size(path: Path) -> int:
+    return int(sum(item.stat().st_size for item in path.rglob("*") if item.is_file()))
+
+
+def _read_artifact_metadata(path: Path) -> dict:
+    metadata_path = path / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        import json
+
+        with metadata_path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}

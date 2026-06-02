@@ -12,6 +12,10 @@ export class ApiError extends Error {
   }
 }
 
+export interface RequestOptions extends RequestInit {
+  timeoutMs?: number;
+}
+
 function makeFriendlyMessage(payload: unknown, fallback: string): string {
   if (payload && typeof payload === 'object') {
     const record = payload as Record<string, unknown>;
@@ -35,9 +39,11 @@ async function readPayload(response: Response): Promise<unknown> {
   return response.text().catch(() => null);
 }
 
-export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutMs = Math.max(options.timeoutMs ?? REQUEST_TIMEOUT_MS, 1000);
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const { timeoutMs: _timeoutMs, ...fetchOptions } = options;
 
   const externalSignal = options.signal;
   const abortFromExternal = () => controller.abort();
@@ -48,7 +54,7 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
 
   try {
     const response = await fetch(buildHttpUrl(path), {
-      ...options,
+      ...fetchOptions,
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
@@ -69,7 +75,7 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
     return (await readPayload(response)) as T;
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new ApiError(`Request timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s`);
+      throw new ApiError(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
     }
     throw error;
   } finally {

@@ -38,6 +38,7 @@ def run_bot_worker(
     model_artifact_path: str | None,
     command_queue,
     response_queue,
+    helformer_artifact_path: str | None = None,
     shared_market_descriptor: dict[str, Any] | None = None,
     market_payload: dict[str, Any] | None = None,
 ) -> None:
@@ -47,10 +48,12 @@ def run_bot_worker(
     try:
         config = load_config(config_path)
         resolved_model_artifact_path = None if model_artifact_path is None else resolve_model_artifact_path(model_artifact_path)
+        resolved_helformer_artifact_path = None if helformer_artifact_path is None else resolve_model_artifact_path(helformer_artifact_path)
         strategy = create_strategy(
             config=config,
             strategy_name=strategy_name,
             model_artifact_path=resolved_model_artifact_path,
+            helformer_artifact_path=resolved_helformer_artifact_path,
         )
 
         if shared_market_descriptor is not None:
@@ -185,3 +188,4 @@ def _portfolio_from_payload(payload: dict[str, Any]) -> BotPortfolioView:
         bar_index=None if payload.get("bar_index") is None else int(payload.get("bar_index")),
         bars_since_entry=int(payload.get("bars_since_entry", 0) or 0),
     )
+

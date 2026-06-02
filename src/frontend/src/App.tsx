@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Navigate, Outlet, Route, Routes, useNavigate, useOutletContext, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { getBacktestExportUrl, getChartData, getReport, listBacktests, listModelArtifacts, runBacktest, waitForBacktestJob } from './api/api';
+import { getBacktestExportUrl, getBacktestJob, getChartData, getReport, isTerminalBacktestJob, listBacktests, listModelArtifacts, runBacktest } from './api/api';
 import { ChartPanel } from './components/ChartPanel';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { LiveReplayPanel } from './components/LiveReplayPanel';
@@ -12,7 +12,7 @@ import { TradesTable } from './components/TradesTable';
 import { WorkerDiagnosticsPanel } from './components/WorkerDiagnosticsPanel';
 import { StatusPill } from './components/StatusPill';
 import { useUiStore } from './stores/uiStore';
-import type { BacktestRunListItem, ChartDataResponse, ModelArtifactItem, ReportResponse, RunDetailTab, StrategyName } from './types';
+import type { BacktestJobResponse, BacktestJobStatus, BacktestRunListItem, ChartDataResponse, ModelArtifactItem, ReportResponse, RunDetailTab, StrategyName } from './types';
 import { downloadTextFile, reportToHtml } from './utils/exports';
 import { formatDate, formatMoney, formatPercent, getRecord } from './utils/formatters';
 
@@ -20,14 +20,33 @@ const STRATEGIES: Array<{ value: StrategyName; label: string; badge: string; des
   { value: 'mean_reversion', label: 'Mean Reversion', badge: 'Classic', description: 'Z-score reversal around rolling mean.', requiresArtifact: false },
   { value: 'adaptive_trend_breakout', label: 'Adaptive Trend', badge: 'Trend', description: 'EMA regime, Donchian breakout, ATR expansion.', requiresArtifact: false },
   { value: 'liquidity_sweep_reversal', label: 'Liquidity Sweep', badge: 'Sweep', description: 'False-breakout reversal with wick and volume confirmation.', requiresArtifact: false },
+  { value: 'adaptive_trend_expansion_pro', label: 'Trend Expansion Pro', badge: 'Pro', description: 'KAMA, Donchian close, CHOP, Vortex and volatility-targeted trend expansion.', requiresArtifact: false },
+  { value: 'capitulation_reversal_pro', label: 'Capitulation Reversal Pro', badge: 'Pro', description: 'Robust shock, VWAP stretch, Connors RSI and wick-quality reversal.', requiresArtifact: false },
+  { value: 'volatility_squeeze_breakout', label: 'Squeeze Breakout', badge: 'SQZ', description: 'TTM squeeze release with Donchian close breakout and volume expansion.', requiresArtifact: false },
+  { value: 'meta_labeled_alpha_allocator_pro', label: 'Meta Alpha Allocator Pro', badge: 'Meta+', description: 'Regime-aware allocator over trend, capitulation reversal, squeeze and cash.', requiresArtifact: false },
   { value: 'ml_momentum', label: 'ML Momentum', badge: 'ML', description: 'Causal feature classifier with probability thresholds.', requiresArtifact: true },
   { value: 'ml_regime_meta_label', label: 'ML Regime Meta', badge: 'Meta', description: 'Regime-aware meta-labeling model.', requiresArtifact: true },
   { value: 'dl_temporal_fusion_momentum', label: 'DL Temporal Fusion', badge: 'DL', description: 'Sequence model for temporal edge detection.', requiresArtifact: true },
+  { value: 'helformer_momentum', label: 'Helformer Momentum', badge: 'HF', description: 'Regime-calibrated next-close forecast momentum.', requiresArtifact: true },
 ];
 
 interface DashboardContext {
   modelArtifactPath: string;
+  helformerArtifactPath: string;
   refreshRuns: () => Promise<void>;
+}
+
+interface TrackedJob {
+  job_id: string;
+  strategy: StrategyName;
+  label: string;
+  submittedAt: number;
+  status: BacktestJobStatus;
+  run_id?: string | null;
+  error?: string | null;
+  message?: string | null;
+  elapsed_seconds?: number | null;
+  updated_at?: number | null;
 }
 
 export default function App() {
@@ -46,43 +65,109 @@ export default function App() {
 function DashboardLayout() {
   const [strategy, setStrategy] = useState<StrategyName>('adaptive_trend_breakout');
   const [modelArtifactPath, setModelArtifactPath] = useState('');
+  const [helformerArtifactPath, setHelformerArtifactPath] = useState('');
+  const [trackedJobs, setTrackedJobs] = useState<TrackedJob[]>(() => readTrackedJobs());
+  const openedRunsRef = useRef<Set<string>>(new Set());
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const currentStrategy = STRATEGIES.find((item) => item.value === strategy) ?? STRATEGIES[0];
+  const usesHelformerProjection = strategy !== 'helformer_momentum';
+  const activeJobs = trackedJobs.filter((job) => !isTerminalBacktestJob(job.status));
+  const activeJobIds = useMemo(() => activeJobs.map((job) => job.job_id), [activeJobs]);
 
-  const runsQuery = useQuery({ queryKey: ['runs'], queryFn: ({ signal }) => listBacktests(signal), refetchInterval: 15000 });
+  const runsQuery = useQuery({ queryKey: ['runs'], queryFn: ({ signal }) => listBacktests(signal), refetchInterval: activeJobs.length > 0 ? 5000 : 15000 });
   const artifactsQuery = useQuery({
-      queryKey: ['model-artifacts'],
-      queryFn: ({ signal }) => listModelArtifacts(signal),
-      enabled: currentStrategy.requiresArtifact,
-      refetchOnWindowFocus: false,
+    queryKey: ['model-artifacts'],
+    queryFn: ({ signal }) => listModelArtifacts(signal),
+    enabled: true,
+    refetchOnWindowFocus: false,
+  });
+  const jobsQuery = useQuery({
+    queryKey: ['active-backtest-jobs', activeJobIds.join('|')],
+    queryFn: ({ signal }) => Promise.all(activeJobIds.map((jobId) => getBacktestJob(jobId, signal))),
+    enabled: activeJobIds.length > 0,
+    refetchInterval: activeJobIds.length > 0 ? 3000 : false,
+    retry: 2,
+    refetchOnWindowFocus: true,
   });
   const runs = validRuns(runsQuery.data);
 
+  useEffect(() => {
+    persistTrackedJobs(trackedJobs);
+  }, [trackedJobs]);
+
+  useEffect(() => {
+    if (!jobsQuery.data?.length) return;
+
+    const jobs = jobsQuery.data;
+    setTrackedJobs((current) => mergeTrackedJobs(current, jobs));
+
+    for (const job of jobs) {
+      const runId = normalizeRunId(job.run_id);
+      if (job.status !== 'completed' || !runId || openedRunsRef.current.has(runId)) continue;
+      openedRunsRef.current.add(runId);
+      void queryClient.invalidateQueries({ queryKey: ['runs'] });
+      void queryClient.invalidateQueries({ queryKey: ['report', runId] });
+      void queryClient.invalidateQueries({ queryKey: ['chart', runId] });
+      navigate(`/runs/${runId}`);
+    }
+  }, [jobsQuery.data, navigate, queryClient]);
+
   const runMutation = useMutation({
     mutationFn: async () => {
-      if (currentStrategy.requiresArtifact && modelArtifactPath.trim().length === 0) {
-        throw new Error(`${currentStrategy.label} needs a model artifact path.`);
+      if (usesHelformerProjection && helformerArtifactPath.trim().length === 0) {
+        throw new Error(`${currentStrategy.label} needs a Helformer next-close forecaster artifact.`);
       }
-      const response = await runBacktest({ strategy, config_path: 'configs/backtest.yaml', model_artifact_path: currentStrategy.requiresArtifact ? modelArtifactPath.trim() : null });
-      const completed = response.run_id ? response : response.job_id ? await waitForBacktestJob(response.job_id) : response;
-      const runId = normalizeRunId(completed.run_id);
-      if (!runId) throw new Error('Backtest completed without a valid run id.');
-      return { ...completed, run_id: runId };
+      if (currentStrategy.requiresArtifact && modelArtifactPath.trim().length === 0) {
+        throw new Error(`${currentStrategy.label} needs a strategy model artifact path.`);
+      }
+      return runBacktest({
+        strategy,
+        config_path: 'configs/backtest.yaml',
+        model_artifact_path: currentStrategy.requiresArtifact ? modelArtifactPath.trim() : null,
+        helformer_artifact_path: usesHelformerProjection ? helformerArtifactPath.trim() : null,
+      });
     },
     onSuccess: async (response) => {
       const runId = normalizeRunId(response.run_id);
-      if (!runId) return;
-      await queryClient.invalidateQueries({ queryKey: ['runs'] });
-      navigate(`/runs/${runId}`);
+      const jobId = normalizeRunId(response.job_id);
+
+      if (runId) {
+        await queryClient.invalidateQueries({ queryKey: ['runs'] });
+        navigate(`/runs/${runId}`);
+        return;
+      }
+
+      if (!jobId) {
+        throw new Error('Backtest was submitted without a job id.');
+      }
+
+      const label = currentStrategy.label;
+      setTrackedJobs((current) => [
+        {
+          job_id: jobId,
+          strategy,
+          label,
+          submittedAt: Date.now(),
+          status: (response.status as BacktestJobStatus) ?? 'queued',
+          run_id: null,
+          error: null,
+          message: response.message ?? 'Queued',
+          elapsed_seconds: response.elapsed_seconds ?? 0,
+          updated_at: response.updated_at ?? Date.now() / 1000,
+        },
+        ...current.filter((job) => job.job_id !== jobId),
+      ].slice(0, 12));
+      await queryClient.invalidateQueries({ queryKey: ['active-backtest-jobs'] });
     },
   });
 
   const selectedRun = runs[0];
   const context = useMemo<DashboardContext>(() => ({
     modelArtifactPath,
+    helformerArtifactPath,
     refreshRuns: async () => { await queryClient.invalidateQueries({ queryKey: ['runs'] }); },
-  }), [modelArtifactPath, queryClient]);
+  }), [modelArtifactPath, helformerArtifactPath, queryClient]);
 
   return (
     <main className="app-shell">
@@ -98,7 +183,7 @@ function DashboardLayout() {
         </nav>
         <div className="top-stats">
           <span>Runs <b>{runs.length}</b></span>
-          <span>Status <b>{runMutation.isPending ? 'Running' : runsQuery.isFetching ? 'Syncing' : 'Ready'}</b></span>
+          <span>Status <b>{activeJobs.length > 0 ? `${activeJobs.length} background job${activeJobs.length === 1 ? '' : 's'}` : runsQuery.isFetching ? 'Syncing' : 'Ready'}</b></span>
           {selectedRun && <span>Last <b>{formatPercent(selectedRun.total_return)}</b></span>}
         </div>
       </header>
@@ -107,7 +192,7 @@ function DashboardLayout() {
         <aside className="sidebar">
           <section className="panel launch-panel">
             <div className="panel-head">
-              <div><span className="kicker">Backtest</span><h2>Launch Strategy</h2><p>Clean strategy launcher with artifact validation.</p></div>
+              <div><span className="kicker">Backtest</span><h2>Launch Strategy</h2><p>Submit long-running jobs without blocking the UI.</p></div>
             </div>
             <div className="strategy-grid">
               {STRATEGIES.map((item) => (
@@ -116,20 +201,37 @@ function DashboardLayout() {
                 </button>
               ))}
             </div>
-              {currentStrategy.requiresArtifact && (
-                  <ArtifactPicker
-                    artifacts={artifactsQuery.data ?? []}
-                    selectedPath={modelArtifactPath}
-                    isLoading={artifactsQuery.isLoading}
-                    error={artifactsQuery.error}
-                    onRefresh={() => artifactsQuery.refetch()}
-                    onSelect={setModelArtifactPath}
-                  />
-                )}
-            <button className="primary" type="button" disabled={runMutation.isPending} onClick={() => runMutation.mutate()}>{runMutation.isPending ? 'Running…' : 'Launch Backtest'}</button>
+            {usesHelformerProjection && (
+              <ArtifactPicker
+                title="Helformer Next-Close Forecaster"
+                description="Used at bar t to project bar t+1 before evaluating the selected strategy."
+                artifacts={filterArtifacts(artifactsQuery.data ?? [], 'helformer_next_close_forecaster')}
+                selectedPath={helformerArtifactPath}
+                isLoading={artifactsQuery.isLoading}
+                error={artifactsQuery.error}
+                onRefresh={() => artifactsQuery.refetch()}
+                onSelect={setHelformerArtifactPath}
+              />
+            )}
+            {currentStrategy.requiresArtifact && (
+              <ArtifactPicker
+                title={strategy === 'helformer_momentum' ? 'Helformer Momentum Strategy' : 'Strategy Model Artifact'}
+                description={strategy === 'helformer_momentum' ? 'Dedicated artifact for native Helformer momentum.' : 'Model used by the selected ML/DL strategy itself.'}
+                artifacts={filterArtifacts(artifactsQuery.data ?? [], strategy === 'helformer_momentum' ? 'helformer_momentum_strategy' : null)}
+                selectedPath={modelArtifactPath}
+                isLoading={artifactsQuery.isLoading}
+                error={artifactsQuery.error}
+                onRefresh={() => artifactsQuery.refetch()}
+                onSelect={setModelArtifactPath}
+              />
+            )}
+            <button className="primary" type="button" disabled={runMutation.isPending} onClick={() => runMutation.mutate()}>{runMutation.isPending ? 'Submitting…' : 'Launch Backtest'}</button>
             {runMutation.isPending && <RunProgress />}
-            {runMutation.error && <div className="notice error"><strong>Backtest failed</strong><p>{runMutation.error.message}</p></div>}
+            {runMutation.error && <div className="notice error"><strong>Backtest submit failed</strong><p>{runMutation.error.message}</p></div>}
+            {jobsQuery.error && activeJobs.length > 0 && <div className="notice error"><strong>Job monitor reconnecting</strong><p>{jobsQuery.error instanceof Error ? jobsQuery.error.message : 'Could not refresh job status.'}</p></div>}
           </section>
+
+          <BackgroundJobsPanel jobs={trackedJobs} onDismiss={(jobId) => setTrackedJobs((current) => current.filter((job) => job.job_id !== jobId))} />
 
           <section className="panel archive-panel">
             <div className="panel-head">
@@ -150,6 +252,71 @@ function DashboardLayout() {
         </section>
       </section>
     </main>
+  );
+}
+
+function readTrackedJobs(): TrackedJob[] {
+  try {
+    const raw = window.localStorage.getItem('quant-background-jobs');
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((job) => typeof job?.job_id === 'string').slice(0, 12) as TrackedJob[];
+  } catch {
+    return [];
+  }
+}
+
+function persistTrackedJobs(jobs: TrackedJob[]): void {
+  try {
+    window.localStorage.setItem('quant-background-jobs', JSON.stringify(jobs.slice(0, 12)));
+  } catch {
+    return;
+  }
+}
+
+function mergeTrackedJobs(current: TrackedJob[], updates: BacktestJobResponse[]): TrackedJob[] {
+  const byId = new Map(current.map((job) => [job.job_id, job]));
+  for (const update of updates) {
+    const previous = byId.get(update.job_id);
+    byId.set(update.job_id, {
+      job_id: update.job_id,
+      strategy: previous?.strategy ?? 'adaptive_trend_breakout',
+      label: previous?.label ?? update.run_id ?? update.job_id,
+      submittedAt: previous?.submittedAt ?? update.created_at * 1000,
+      status: update.status,
+      run_id: update.run_id,
+      error: update.error,
+      message: update.message,
+      elapsed_seconds: update.elapsed_seconds,
+      updated_at: update.updated_at,
+    });
+  }
+  return [...byId.values()].sort((left, right) => right.submittedAt - left.submittedAt).slice(0, 12);
+}
+
+function BackgroundJobsPanel({ jobs, onDismiss }: { jobs: TrackedJob[]; onDismiss: (jobId: string) => void }) {
+  if (jobs.length === 0) return null;
+  return (
+    <section className="panel archive-panel">
+      <div className="panel-head">
+        <div><span className="kicker">Background</span><h2>Backtest Jobs</h2><p>Jobs keep running server-side; completed runs open automatically.</p></div>
+      </div>
+      <div className="run-list">
+        {jobs.map((job) => {
+          const terminal = isTerminalBacktestJob(job.status);
+          return (
+            <article key={job.job_id} className="run-item">
+              <b>{job.label}</b>
+              <em>{job.status}</em>
+              <small>{job.job_id}</small>
+              <small>{job.run_id ? `Run ${job.run_id}` : job.error || job.message || 'Waiting for engine update'} · {formatDuration(job.elapsed_seconds)}</small>
+              {terminal && <button type="button" onClick={() => onDismiss(job.job_id)}>Dismiss</button>}
+            </article>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -241,8 +408,8 @@ function RunDetailPage() {
 }
 
 function LivePage() {
-  const { modelArtifactPath, refreshRuns } = useOutletContext<DashboardContext>();
-  return <LiveReplayPanel modelArtifactPath={modelArtifactPath} onCompleted={refreshRuns} />;
+  const { modelArtifactPath, helformerArtifactPath, refreshRuns } = useOutletContext<DashboardContext>();
+  return <LiveReplayPanel modelArtifactPath={modelArtifactPath} helformerArtifactPath={helformerArtifactPath} onCompleted={refreshRuns} />;
 }
 
 function JsonPanel({ title, data }: { title: string; data: unknown }) {
@@ -271,6 +438,8 @@ function EquityDistribution({ report }: { report: ReportResponse | null }) {
 }
 
 function ArtifactPicker({
+  title = 'Select model from outputs/models',
+  description,
   artifacts,
   selectedPath,
   isLoading,
@@ -278,6 +447,8 @@ function ArtifactPicker({
   onRefresh,
   onSelect,
 }: {
+  title?: string;
+  description?: string;
   artifacts: ModelArtifactItem[];
   selectedPath: string;
   isLoading: boolean;
@@ -299,7 +470,8 @@ function ArtifactPicker({
       <div className="artifact-picker-head">
         <div>
           <span className="kicker">Model Artifact</span>
-          <h3>Select model from outputs/models</h3>
+          <h3>{title}</h3>
+          {description && <p>{description}</p>}
         </div>
 
         <button type="button" onClick={onRefresh}>
@@ -358,7 +530,7 @@ function ArtifactPicker({
 
                   <span className="artifact-meta">
                     <b>{artifact.name}</b>
-                    <small>{artifact.path}</small>
+                    <small>{artifact.path}{artifact.artifact_role ? ` · ${artifact.artifact_role}` : ''}</small>
                   </span>
 
                   <em>{formatFileSize(artifact.size_bytes)}</em>
@@ -379,6 +551,12 @@ function ArtifactPicker({
   );
 }
 
+function filterArtifacts(artifacts: ModelArtifactItem[], role: string | null): ModelArtifactItem[] {
+  if (!role) return artifacts;
+  const exact = artifacts.filter((artifact) => artifact.artifact_role === role || artifact.path.includes(role));
+  return exact.length > 0 ? exact : artifacts;
+}
+
 function formatFileSize(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0 B';
 
@@ -397,10 +575,21 @@ function formatFileSize(value: number): string {
 function RunProgress() {
   return (
     <div className="job-progress">
-      <span>Submitting → loading data → running engine → writing report</span>
+      <span>Submitting job → monitor starts automatically</span>
       <div><i /></div>
     </div>
   );
+}
+
+function formatDuration(seconds: unknown): string {
+  const value = Number(seconds ?? 0);
+  if (!Number.isFinite(value) || value <= 0) return '0s';
+  const minutes = Math.floor(value / 60);
+  const rest = Math.floor(value % 60);
+  if (minutes <= 0) return `${rest}s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours <= 0) return `${minutes}m ${rest}s`;
+  return `${hours}h ${minutes % 60}m`;
 }
 
 function normalizeReport(report?: ReportResponse | null): ReportResponse | null {

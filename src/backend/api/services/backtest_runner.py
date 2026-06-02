@@ -29,6 +29,7 @@ def run_backtest_from_request(
     config_path: str,
     strategy_name: str,
     model_artifact_path: str | None,
+    helformer_artifact_path: str | None = None,
     cancel_event: threading.Event | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     robot_payload = {
@@ -39,6 +40,7 @@ def run_backtest_from_request(
                 "worker_id": f"{strategy_name}_worker_1",
                 "strategy": strategy_name,
                 "model_artifact_path": model_artifact_path,
+                "helformer_artifact_path": helformer_artifact_path,
             }
         ],
     }
@@ -102,15 +104,22 @@ def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_qu
         for raw_worker in robot.get("strategy_workers", []):
             strategy_name = str(raw_worker.get("strategy"))
             model_artifact_path = raw_worker.get("model_artifact_path")
+            helformer_artifact_path = raw_worker.get("helformer_artifact_path")
             resolved_model_path = (
                 resolve_model_artifact_path(model_artifact_path)
                 if model_artifact_path is not None and str(model_artifact_path).strip()
+                else None
+            )
+            resolved_helformer_path = (
+                resolve_model_artifact_path(helformer_artifact_path)
+                if helformer_artifact_path is not None and str(helformer_artifact_path).strip()
                 else None
             )
             strategy = create_strategy(
                 config=config,
                 strategy_name=strategy_name,
                 model_artifact_path=resolved_model_path,
+                helformer_artifact_path=resolved_helformer_path,
             )
             worker_specs.append(
                 BacktestWorkerSpec(
@@ -118,6 +127,7 @@ def _run_robot_backtest_child(config_path: str, robot: dict[str, Any], result_qu
                     strategy_name=strategy_name,
                     strategy=strategy,
                     model_artifact_path=str(resolved_model_path) if resolved_model_path else None,
+                    helformer_artifact_path=str(resolved_helformer_path) if resolved_helformer_path else None,
                 )
             )
 
@@ -138,3 +148,4 @@ def _read_summary(run_dir: Path) -> dict[str, Any]:
     summary_path = run_dir / "summary.json"
     with summary_path.open("r", encoding="utf-8") as file:
         return json.load(file)
+

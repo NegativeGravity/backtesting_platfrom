@@ -36,6 +36,7 @@ class BacktestWorkerSpec:
     strategy_name: str
     strategy: BaseStrategy
     model_artifact_path: str | None = None
+    helformer_artifact_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class PendingOrder:
     signal_time: pd.Timestamp
     reason: str
     target_notional_fraction: float
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
 
 
 @dataclass
@@ -110,6 +113,8 @@ class StrategyPortfolioView:
         position: OpenPosition | None,
         equity: float,
         cash: float,
+        current_price: float | None = None,
+        bars_since_entry: int = 0,
     ) -> None:
         self.symbol = symbol
         self.position_quantity = 0.0 if position is None else position.quantity
@@ -117,6 +122,13 @@ class StrategyPortfolioView:
         self.equity = equity
         self.cash = cash
         self.has_position = position is not None
+        self.current_price = current_price
+        self.entry_price = None if position is None else position.entry_price
+        self.stop_loss = None if position is None else position.stop_loss
+        self.take_profit = None if position is None else position.take_profit
+        self.unrealized_pnl = None if position is None else position.unrealized_pnl
+        self.unrealized_return_pct = None if position is None else position.unrealized_return_pct
+        self.bars_since_entry = int(bars_since_entry)
 
 
 class RobotBacktestEngine:
@@ -141,6 +153,10 @@ class RobotBacktestEngine:
         self._config = config
         self._data = data.reset_index(drop=True)
         self._market = MarketDataView.from_frame(self._data)
+        self._timestamp_index = {
+            pd.Timestamp(row["timestamp"]): int(index)
+            for index, row in self._data[["timestamp"]].iterrows()
+        }
         self._robot_spec = robot_spec
         self._event_callback = event_callback
         configured_fraction = float(capital_per_trade_fraction or config.risk.max_position_notional_pct)
@@ -233,6 +249,7 @@ class RobotBacktestEngine:
                         "worker_id": worker.worker_id,
                         "strategy": worker.strategy_name,
                         "model_artifact_path": worker.model_artifact_path,
+                        "helformer_artifact_path": worker.helformer_artifact_path,
                     }
                     for worker in self._runtime.workers.values()
                 ],
@@ -271,6 +288,8 @@ class RobotBacktestEngine:
             position=position,
             equity=self._calculate_equity(),
             cash=self._runtime.cash,
+            current_price=float(current_bar["close"]),
+            bars_since_entry=self._bars_since_entry(position, bar_index),
         )
         signal = call_strategy_signal(worker.strategy, self._market, bar_index, portfolio_view)
         self._record_signal(worker, signal)
@@ -340,7 +359,10 @@ class RobotBacktestEngine:
                 )
                 return
             action = OrderAction.BUY_TO_OPEN if signal.signal_type == SignalType.LONG else OrderAction.SELL_TO_OPEN
-            target_fraction = self._capital_fraction
+            raw_target_fraction = signal.metadata.get("target_notional_fraction", self._capital_fraction) if isinstance(signal.metadata, dict) else self._capital_fraction
+            target_fraction = min(max(float(raw_target_fraction), 0.0), self._capital_fraction)
+            stop_loss_pct = _positive_metadata_float(signal.metadata, "stop_loss_pct")
+            take_profit_pct = _positive_metadata_float(signal.metadata, "take_profit_pct")
             quantity = 0.0
         else:
             if position is None:
@@ -356,6 +378,8 @@ class RobotBacktestEngine:
                 return
             action = OrderAction.SELL_TO_CLOSE if position.side == PositionSide.LONG else OrderAction.BUY_TO_CLOSE
             target_fraction = 0.0
+            stop_loss_pct = None
+            take_profit_pct = None
             quantity = position.quantity
 
         if any(order.worker_id == worker.worker_id and order.symbol == signal.symbol for order in self._runtime.pending_orders):
@@ -382,6 +406,8 @@ class RobotBacktestEngine:
                 signal_time=signal.timestamp,
                 reason=signal.reason,
                 target_notional_fraction=target_fraction,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
             )
         )
 
@@ -396,7 +422,7 @@ class RobotBacktestEngine:
         for order in self._runtime.pending_orders:
             try:
                 if order.action in {OrderAction.BUY_TO_OPEN, OrderAction.SELL_TO_OPEN}:
-                    quantity = self._size_entry_quantity(open_price)
+                    quantity = self._size_entry_quantity(open_price, order.target_notional_fraction)
                     if quantity <= 0:
                         self._record_order_status(timestamp, order, status="REJECTED", reason="quantity_below_minimum")
                         continue
@@ -501,7 +527,7 @@ class RobotBacktestEngine:
                 slippage_cost=slippage_cost,
             )
 
-    def _size_entry_quantity(self, price: float) -> float:
+    def _size_entry_quantity(self, price: float, target_notional_fraction: float | None = None) -> float:
         equity = self._calculate_equity()
         risk_amount = equity * self._config.risk.risk_per_trade_pct
         stop_distance_pct = max(self._config.risk.stop_distance_pct, 1e-9)
@@ -509,7 +535,8 @@ class RobotBacktestEngine:
         risk_notional = equity * self._config.risk.max_position_notional_pct
         min_cash_reserve = equity * self._config.risk.min_cash_pct
         deployable_cash = max(0.0, self._runtime.cash - min_cash_reserve)
-        target_notional = min(equity * self._capital_fraction, stop_based_notional, risk_notional, deployable_cash)
+        fraction = self._capital_fraction if target_notional_fraction is None else min(max(float(target_notional_fraction), 0.0), self._capital_fraction)
+        target_notional = min(equity * fraction, stop_based_notional, risk_notional, deployable_cash)
         if target_notional < self._config.risk.min_order_notional or price <= 0:
             return 0.0
         quantity = target_notional / price
@@ -546,12 +573,15 @@ class RobotBacktestEngine:
         fee: float,
         slippage_cost: float,
     ) -> None:
+        stop_loss_pct = order.stop_loss_pct if order.stop_loss_pct is not None and order.stop_loss_pct > 0.0 else self._stop_loss_pct
+        take_profit_pct = order.take_profit_pct if order.take_profit_pct is not None and order.take_profit_pct > 0.0 else self._take_profit_pct
+
         if side == PositionSide.LONG:
-            stop_loss = fill_price * (1.0 - self._stop_loss_pct)
-            take_profit = fill_price * (1.0 + self._take_profit_pct)
+            stop_loss = fill_price * (1.0 - stop_loss_pct)
+            take_profit = fill_price * (1.0 + take_profit_pct)
         else:
-            stop_loss = fill_price * (1.0 + self._stop_loss_pct)
-            take_profit = fill_price * (1.0 - self._take_profit_pct)
+            stop_loss = fill_price * (1.0 + stop_loss_pct)
+            take_profit = fill_price * (1.0 - take_profit_pct)
 
         position = OpenPosition(
             position_id=new_id("pos"),
@@ -589,6 +619,17 @@ class RobotBacktestEngine:
         self._runtime.cash += position.notional + closed.gross_pnl - exit_fee
         self._runtime.closed_positions.append(closed)
         self._runtime.open_positions.pop(position_key(position.worker_id, position.symbol), None)
+
+    def _bars_since_entry(self, position: OpenPosition | None, current_index: int) -> int:
+        if position is None:
+            return 0
+        timestamp = pd.Timestamp(position.entry_time)
+        entry_index = self._timestamp_index.get(timestamp)
+        if entry_index is None:
+            entry_index = self._timestamp_index.get(timestamp.tz_convert("UTC") if timestamp.tzinfo else timestamp.tz_localize("UTC"))
+        if entry_index is None:
+            return 0
+        return max(0, int(current_index) - int(entry_index))
 
     def _get_worker_position(self, worker_id: str, symbol: str) -> OpenPosition | None:
         return self._runtime.open_positions.get(position_key(worker_id, symbol))
@@ -721,3 +762,19 @@ class RobotBacktestEngine:
         if self._event_callback is None:
             return
         self._event_callback({"event_type": event_type, "source": "robot_backtest_engine", "payload": payload})
+
+
+
+
+
+
+def _positive_metadata_float(metadata: dict[str, Any] | None, key: str) -> float | None:
+    if not isinstance(metadata, dict):
+        return None
+    try:
+        value = float(metadata.get(key))
+    except (TypeError, ValueError):
+        return None
+    if value > 0.0:
+        return value
+    return None
