@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="[assets/logo.png](https://chatgpt.com/s/m_6a1ea564ee808191b9c6e34f17411af1)" alt="Quant Research Terminal Logo" width="160" />
+  <img src="assets/app-logo.png" width="160" />
   <h1>Quant Research Terminal</h1>
   <p>
     A research-grade trading robot and backtesting platform for crypto and market assets, built with a clean Python backend, a modern React frontend, and multiple rule-based, machine-learning, deep-learning, and Helformer-assisted strategies.
